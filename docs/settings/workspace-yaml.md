@@ -16,7 +16,7 @@ Aube generates this page from [`settings.toml`](https://github.com/endevco/aube/
 
 ## Summary
 
-49 settings are listed here.
+50 settings are listed here.
 
 | Setting | Type | Summary |
 | --- | --- | --- |
@@ -41,6 +41,7 @@ Aube generates this page from [`settings.toml`](https://github.com/endevco/aube/
 | [`virtualStoreDir`](#setting-virtualstoredir) | `path` | Directory with links to the store. |
 | [`packageImportMethod`](#setting-packageimportmethod) | `"auto" \| "hardlink" \| "copy" \| "clone" \| "clone-or-copy"` | Method for importing packages from the store into node_modules. |
 | [`enableGlobalVirtualStore`](#setting-enableglobalvirtualstore) | `bool` | Use a per-user virtual store for all projects. |
+| [`disableGlobalVirtualStoreForPackages`](#setting-disableglobalvirtualstoreforpackages) | `list<string>` | Package names whose presence in any importer forces per-project materialization. |
 | [`storeDir`](#setting-storedir) | `path` | Location where packages are saved on disk (content-addressable store). |
 | [`verifyStoreIntegrity`](#setting-verifystoreintegrity) | `bool` | Check store file integrity before linking. |
 | [`lockfile`](#setting-lockfile) | `bool` | Read and generate aube-lock.yaml. |
@@ -399,6 +400,29 @@ aube ships its own global virtual store under `~/.cache/aube/virtual-store/`.
 It's enabled by default and disabled under CI (see `aube-linker`, which
 checks the `CI` env var). pnpm gained the same feature later; we expose
 it through `CI=1` rather than a dedicated config knob.
+
+### `disableGlobalVirtualStoreForPackages` {#setting-disableglobalvirtualstoreforpackages}
+
+Package names whose presence in any importer forces per-project materialization.
+
+- Type: `list<string>`
+- Default: `["next"]`
+- Workspace YAML keys: `disableGlobalVirtualStoreForPackages`
+
+aube's global virtual store makes `node_modules/.aube/<pkg>` an
+absolute symlink into `~/.cache/aube/virtual-store/`. Some tools —
+most notably Next.js's Turbopack — canonicalize every symlink under
+`node_modules/` and reject any target that resolves outside the
+project's "filesystem root", producing errors like `Symlink ... is
+invalid, it points out of the filesystem root`.
+
+When `aube install` finds one of these names in any importer's
+`dependencies`, `devDependencies`, or `optionalDependencies`, it
+forces per-project materialization for that install and prints a
+one-line warning naming the trigger. Defaults to `["next"]`; add
+other packages here as you discover them, or set the list to `[]` to
+disable the heuristic. `CI=1` already forces per-project mode, so the
+warning suppresses itself in that case.
 
 ## Store
 

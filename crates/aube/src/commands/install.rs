@@ -2132,6 +2132,35 @@ fn resolve_exclude_links_from_lockfile(ctx: &aube_settings::ResolveCtx<'_>) -> b
     aube_settings::resolved::exclude_links_from_lockfile(ctx)
 }
 
+/// Scan `manifests` for any `trigger` name that appears in an
+/// importer's `dependencies`, `devDependencies`, or
+/// `optionalDependencies`, and return the first match. Used to power
+/// `disableGlobalVirtualStoreForPackages` — some tools (Next.js's
+/// Turbopack is the canonical example) canonicalize every
+/// `node_modules/<pkg>` symlink and reject targets that escape the
+/// project's filesystem root, which aube's global virtual store
+/// produces by default. When a manifest declares one of those
+/// packages, the install driver falls back to per-project
+/// materialization. `peerDependencies` intentionally doesn't count —
+/// a library that declares `next` as a peer isn't itself a Next.js
+/// app.
+fn find_gvs_incompatible_trigger<'a>(
+    manifests: &[(String, aube_manifest::PackageJson)],
+    triggers: &'a [String],
+) -> Option<&'a str> {
+    for (_, m) in manifests {
+        for name in triggers {
+            if m.dependencies.contains_key(name)
+                || m.dev_dependencies.contains_key(name)
+                || m.optional_dependencies.contains_key(name)
+            {
+                return Some(name.as_str());
+            }
+        }
+    }
+    None
+}
+
 /// Honor `cleanupUnusedCatalogs` by pruning declared-but-unreferenced
 /// catalog entries from the workspace yaml. No-op when the setting is
 /// off, when there is no workspace yaml file on disk, or when every
@@ -3089,6 +3118,44 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         }
     }
 
+    // Auto-disable the global virtual store when any importer depends
+    // on a package listed in `disableGlobalVirtualStoreForPackages`
+    // (default `["next"]`). Turbopack canonicalizes every
+    // `node_modules/<pkg>` symlink and rejects targets outside the
+    // project dir; gvs makes `.aube/<pkg>` an absolute symlink into
+    // `~/.cache/aube/virtual-store/`, which trips that check. The
+    // list is the extension point — add other tools as they surface.
+    // `CI=1` already forces per-project mode in `Linker::new`, so we
+    // don't warn in that case (behavior wouldn't change and the
+    // message would just be noise). `virtualStoreOnly` installs skip
+    // the final top-level symlink pass, so Turbopack never sees the
+    // gvs path — suppress the warning there too.
+    let gvs_triggers =
+        aube_settings::resolved::disable_global_virtual_store_for_packages(&settings_ctx);
+    let use_global_virtual_store_override = {
+        let triggered_by = find_gvs_incompatible_trigger(&manifests, &gvs_triggers);
+        // Match `Linker::new`'s exact gvs check — it keys off the `CI`
+        // env var alone, not `npm_config_ci` / `NPM_CONFIG_CI`. Using a
+        // broader set here would silently skip the override (and the
+        // warning) in a scenario where the linker still turns gvs on,
+        // leaving the Turbopack symlink error unmitigated. The snapshot
+        // is populated from `std::env` at `InstallOptions::from_cli`
+        // time, so it reflects the same environment the linker reads.
+        let ci_mode = opts.env_snapshot.iter().any(|(k, _)| k == "CI");
+        let virtual_store_only_setting = aube_settings::resolved::virtual_store_only(&settings_ctx);
+        if let Some(name) = triggered_by
+            && !ci_mode
+            && !virtual_store_only_setting
+        {
+            tracing::warn!(
+                "disabling global virtual store: `{name}` is in disableGlobalVirtualStoreForPackages (packages in that list are known to be incompatible with gvs-linked node_modules, e.g. Next.js's Turbopack rejects symlinks that escape the project root). Set the list to `[]` in .npmrc to opt out."
+            );
+            Some(false)
+        } else {
+            None
+        }
+    };
+
     // Remember which lockfile format the project currently uses so
     // every downstream write site (the `--lockfile-only` short-circuit
     // below *and* the re-resolve branch further down) can preserve it
@@ -3773,8 +3840,20 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
                 if !materialize_patches.is_empty() {
                     linker = linker.with_patches(materialize_patches);
                 }
+                // Carry the Next.js / `disableGlobalVirtualStoreForPackages`
+                // override the main linker got — without this the prewarm
+                // linker would still see `gvs = CI.is_err() = true`, spend
+                // the whole fetch phase materializing into
+                // `~/.cache/aube/virtual-store/`, and then throw all of that
+                // work away when link phase runs in per-project mode. The
+                // `!uses_global_virtual_store` short-circuit below depends
+                // on this being applied first.
+                if let Some(enabled) = use_global_virtual_store_override {
+                    linker = linker.with_use_global_virtual_store(enabled);
+                }
                 if !linker.uses_global_virtual_store() {
-                    // CI mode: `.aube/<dep_path>` is per-project so
+                    // Per-project mode (CI=1 or gvs-incompatible package
+                    // detected): `.aube/<dep_path>` is per-project so
                     // prewarming a shared store is pointless. Drain the
                     // channel to unblock the sender and return empty stats.
                     let mut rx = materialize_rx;
@@ -4155,6 +4234,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         }
     };
     tracing::debug!("node-linker: {:?}", node_linker);
+
     let mut linker = aube_linker::Linker::new(store.as_ref(), strategy)
         .with_shamefully_hoist(shamefully_hoist)
         .with_public_hoist_pattern(&public_hoist_pattern)
@@ -4168,6 +4248,9 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         .with_virtual_store_only(virtual_store_only)
         .with_modules_dir_name(modules_dir_name.clone())
         .with_aube_dir_override(aube_dir.clone());
+    if let Some(enabled) = use_global_virtual_store_override {
+        linker = linker.with_use_global_virtual_store(enabled);
+    }
 
     // 6a. Pre-compute content-addressed virtual-store hashes.
     //     Only necessary when linking into the shared global virtual

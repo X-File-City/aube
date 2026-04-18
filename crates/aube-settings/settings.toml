@@ -598,6 +598,32 @@ examples = []
 # `aube-linker`. The typed accessor would double up on that path.
 typedAccessorUnused = true
 
+[disableGlobalVirtualStoreForPackages]
+description = "Package names whose presence in any importer forces per-project materialization."
+type = "list<string>"
+default = "[\"next\"]"
+docs = """
+aube's global virtual store makes `node_modules/.aube/<pkg>` an
+absolute symlink into `~/.cache/aube/virtual-store/`. Some tools —
+most notably Next.js's Turbopack — canonicalize every symlink under
+`node_modules/` and reject any target that resolves outside the
+project's "filesystem root", producing errors like `Symlink ... is
+invalid, it points out of the filesystem root`.
+
+When `aube install` finds one of these names in any importer's
+`dependencies`, `devDependencies`, or `optionalDependencies`, it
+forces per-project materialization for that install and prints a
+one-line warning naming the trigger. Defaults to `["next"]`; add
+other packages here as you discover them, or set the list to `[]` to
+disable the heuristic. `CI=1` already forces per-project mode, so the
+warning suppresses itself in that case.
+"""
+sources.cli = []
+sources.env = []
+sources.npmrc = ["disableGlobalVirtualStoreForPackages"]
+sources.workspaceYaml = ["disableGlobalVirtualStoreForPackages"]
+examples = []
+
 # ========================================= Store =========================================
 
 [storeDir]

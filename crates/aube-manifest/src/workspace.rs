@@ -28,6 +28,18 @@ pub struct WorkspaceConfig {
     #[serde(default)]
     pub enable_global_virtual_store: Option<bool>,
 
+    /// Package names whose presence in any importer forces
+    /// per-project materialization (disabling the global virtual
+    /// store for that install). Defaults to `["next"]` — Turbopack
+    /// rejects `node_modules/<pkg>` symlinks that canonicalize
+    /// outside the project's filesystem root. Add more names as
+    /// you discover tools with the same restriction; set to `[]` to
+    /// disable the heuristic. Declared here so `settings.toml`'s
+    /// workspaceYaml source stays in sync with the actual
+    /// deserialize surface.
+    #[serde(default)]
+    pub disable_global_virtual_store_for_packages: Option<Vec<String>>,
+
     /// Package import method: "auto", "hardlink", "copy", "clone", "clone-or-copy".
     #[serde(default)]
     pub package_import_method: Option<String>,
