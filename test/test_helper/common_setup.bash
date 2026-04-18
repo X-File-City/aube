@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+
+_common_setup() {
+	load 'test_helper/bats-support/load'
+	load 'test_helper/bats-assert/load'
+	load 'test_helper/bats-file/load'
+
+	PROJECT_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
+	export PATH="$PROJECT_ROOT/target/debug:$PATH"
+
+	TEST_TEMP_DIR="$(temp_make)"
+	cd "$TEST_TEMP_DIR" || exit 1
+
+	# Isolate HOME so we don't pollute the real pnpm store
+	export HOME="$TEST_TEMP_DIR"
+	export XDG_CACHE_HOME="$HOME/.cache"
+	export XDG_CONFIG_HOME="$HOME/.config"
+	export XDG_DATA_HOME="$HOME/.local/share"
+	export XDG_STATE_HOME="$HOME/.local/state"
+	export TMPDIR="$TEST_TEMP_DIR/tmp"
+	mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$TMPDIR"
+
+	# Tests assume a "local dev" install environment. Unset CI so the
+	# default FrozenMode is Prefer, not Frozen — otherwise tests that
+	# install without a pre-built lockfile (e.g. workspace fixtures)
+	# would fail with a frozen-lockfile error in CI runs.
+	unset CI
+
+	# Keep host shell logging preferences from overriding tests that assert
+	# aube's CLI/config loglevel behavior.
+	unset RUST_LOG
+
+	# Keep the update notifier (install.rs:… -> update_check.rs) from
+	# hitting aube.en.dev during BATS. Unsetting CI re-enables it by
+	# default, so we suppress it explicitly here — otherwise every
+	# `aube install` / `add` / `update` test would spend ~1.5s on a
+	# DNS/timeout round-trip for no benefit.
+	export AUBE_NO_UPDATE_CHECK=1
+
+	# Point to local Verdaccio registry if running
+	if [ -n "${AUBE_TEST_REGISTRY:-}" ]; then
+		echo "registry=${AUBE_TEST_REGISTRY}" >"$TEST_TEMP_DIR/.npmrc"
+	fi
+}
+
+_common_teardown() {
+	temp_del "$TEST_TEMP_DIR"
+}
+
+# Create a minimal package.json + aube-lock.yaml fixture in cwd.
+# Deliberately does NOT copy the pnpm-lock.yaml sidecar — tests that
+# want to exercise the pnpm→aube migration path should copy it
+# explicitly.
+_setup_basic_fixture() {
+	cp "$PROJECT_ROOT/fixtures/basic/package.json" .
+	cp "$PROJECT_ROOT/fixtures/basic/aube-lock.yaml" .
+}

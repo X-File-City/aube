@@ -1,0 +1,29 @@
+[package]
+name = "aube-registry"
+description = "npm registry HTTP client for Aube"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+aube-manifest = { workspace = true }
+aube-settings = { workspace = true }
+reqwest = { workspace = true, features = ["native-tls"] }
+base64 = { workspace = true }
+bytes = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+simd-json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+flate2 = { workspace = true }
+serde_yaml = { workspace = true }
+tar = { workspace = true }
+wiremock = "0.6"

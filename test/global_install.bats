@@ -1,0 +1,145 @@
+#!/usr/bin/env bats
+
+setup() {
+	load 'test_helper/common_setup'
+	_common_setup
+	# Route global installs into the per-test temp dir so nothing escapes
+	# the sandbox. `bin_dir` = AUBE_HOME, `pkg_dir` = AUBE_HOME/global-aube.
+	# aube prints AUBE_HOME as-is (no canonicalize), so compare against the
+	# env var verbatim, not `pwd -P`.
+	export AUBE_HOME="$TEST_TEMP_DIR/aube-home"
+	mkdir -p "$AUBE_HOME"
+}
+
+teardown() {
+	_common_teardown
+}
+
+@test "aube bin -g prints the global bin directory" {
+	run aube bin -g
+	assert_success
+	assert_output "$AUBE_HOME"
+}
+
+@test "aube root -g prints the global package directory" {
+	run aube root -g
+	assert_success
+	assert_output "$AUBE_HOME/global-aube"
+}
+
+@test "aube bin -g honors PNPM_HOME when AUBE_HOME is unset" {
+	unset AUBE_HOME
+	PNPM_HOME="$TEST_TEMP_DIR/pnpm-home" run aube bin -g
+	assert_success
+	assert_output "$TEST_TEMP_DIR/pnpm-home"
+}
+
+@test "aube list -g reports nothing on an empty global dir" {
+	run aube list -g
+	assert_success
+	assert_output --partial "no global packages installed"
+}
+
+@test "aube add -g installs a package and links its bin" {
+	run aube add -g semver@7.7.4
+	assert_success
+
+	# bin symlink lands in $AUBE_HOME
+	assert_file_exists "$AUBE_HOME/semver"
+
+	# list -g picks it up
+	run aube list -g
+	assert_success
+	assert_output --partial "semver 7.7.4"
+
+	# parseable output is one tab-separated line per package
+	run aube list -g --parseable
+	assert_success
+	assert_output --partial "	semver	7.7.4"
+
+	# json output includes name/version
+	run aube list -g --json
+	assert_success
+	assert_output --partial '"name": "semver"'
+	assert_output --partial '"version": "7.7.4"'
+}
+
+@test "aube add -g creates a hash pointer in the pkg dir" {
+	run aube add -g semver@7.7.4
+	assert_success
+
+	# At least one symlink entry (the hash) should exist in the pkg dir
+	pkg_dir="$AUBE_HOME/global-aube"
+	run bash -c "find '$pkg_dir' -maxdepth 1 -type l | wc -l | tr -d ' '"
+	assert_success
+	assert_output "1"
+}
+
+@test "aube add -g twice replaces the prior install" {
+	run aube add -g semver@7.7.4
+	assert_success
+	run aube add -g semver@7.7.4
+	assert_success
+
+	# Only one install dir + one hash pointer should remain.
+	pkg_dir="$AUBE_HOME/global-aube"
+	run bash -c "find '$pkg_dir' -maxdepth 1 -type l | wc -l | tr -d ' '"
+	assert_output "1"
+	run bash -c "find '$pkg_dir' -maxdepth 1 -type d | tail -n +2 | wc -l | tr -d ' '"
+	assert_output "1"
+}
+
+@test "aube remove -g deletes the install and unlinks its bin" {
+	run aube add -g semver@7.7.4
+	assert_success
+	assert_file_exists "$AUBE_HOME/semver"
+
+	run aube remove -g semver
+	assert_success
+	assert_file_not_exists "$AUBE_HOME/semver"
+
+	run aube list -g
+	assert_success
+	assert_output --partial "no global packages installed"
+}
+
+@test "aube remove -g unlinks a preferSymlinkedExecutables=false shell shim" {
+	# With the setting off, the global `.bin/<name>` is a regular-file
+	# shell shim rather than a symlink. `unlink_bins` still has to
+	# recognize it as ours and remove it on `aube remove -g`.
+	cat >"$HOME/.npmrc" <<-EOF
+		registry=${AUBE_TEST_REGISTRY}
+		preferSymlinkedExecutables=false
+	EOF
+
+	run aube add -g semver@7.7.4
+	assert_success
+	assert_file_exists "$AUBE_HOME/semver"
+	# Regular file, not a symlink — the whole point of this scenario.
+	[ ! -L "$AUBE_HOME/semver" ]
+
+	run aube remove -g semver
+	assert_success
+	assert_file_not_exists "$AUBE_HOME/semver"
+}
+
+@test "aube list -g applies the positional name filter" {
+	run aube add -g semver@7.7.4
+	assert_success
+
+	# Non-matching prefix hides the entry
+	run aube list -g nothing
+	assert_success
+	refute_output --partial "semver"
+
+	# Matching prefix keeps it
+	run aube list -g sem
+	assert_success
+	assert_output --partial "semver 7.7.4"
+}
+
+@test "aube remove -g on a missing package errors" {
+	run aube remove -g nonexistent-pkg
+	assert_failure
+	assert_output --partial "no matching global packages were removed"
+}

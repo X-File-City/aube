@@ -1,0 +1,510 @@
+//! `aube pack` — build a publishable `.tgz` tarball from the current project.
+//!
+//! Mirrors `pnpm pack` / `npm pack`: the tarball entry names are rooted at
+//! `package/`, every entry has a fixed mtime (1985-10-26 08:15:00 UTC) so
+//! identical inputs produce byte-identical archives, and the default
+//! output path is `<sanitized-name>-<version>.tgz` in the current directory.
+//!
+//! File selection follows npm's rules in priority order:
+//!   1. `files` field in package.json — each entry is a glob relative to
+//!      the project dir. Everything reachable is included.
+//!   2. Otherwise: walk the project, skip the npm standard-ignore list
+//!      (`.git/`, `node_modules/`, `*.tgz`, CI dotfiles, etc.), and
+//!      respect a root-level `.npmignore` (or `.gitignore` if no
+//!      `.npmignore` exists) with line-based prefix matching.
+//!
+//! In both cases `package.json`, `README*`, `LICENSE*`/`LICENCE*`, and the
+//! `main` entry are always included — matching npm's "always-on" list.
+
+use aube_manifest::PackageJson;
+use clap::Args;
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use miette::{Context, IntoDiagnostic, miette};
+use serde::Serialize;
+use std::collections::BTreeSet;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Args)]
+pub struct PackArgs {
+    /// Don't write the tarball; print what would be packed
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Print the result as a JSON object
+    #[arg(long)]
+    pub json: bool,
+    /// Directory to write the tarball into (default: current directory)
+    #[arg(long, value_name = "DIR")]
+    pub pack_destination: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+struct PackResult {
+    name: String,
+    version: String,
+    filename: String,
+    files: Vec<FileEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct FileEntry {
+    path: String,
+}
+
+pub async fn run(args: PackArgs) -> miette::Result<()> {
+    let invocation_cwd = crate::dirs::cwd()?;
+    let project_root = crate::dirs::project_root()?;
+    let archive = build_archive(&project_root)?;
+
+    let dest_dir = args
+        .pack_destination
+        .as_deref()
+        .map(|p| {
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                invocation_cwd.join(p)
+            }
+        })
+        .unwrap_or_else(|| invocation_cwd.clone());
+    let dest_path = dest_dir.join(&archive.filename);
+
+    if !args.dry_run {
+        std::fs::create_dir_all(&dest_dir)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create {}", dest_dir.display()))?;
+        std::fs::write(&dest_path, &archive.tarball)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to write {}", dest_path.display()))?;
+    }
+
+    let relative_filename = if dest_dir == invocation_cwd {
+        archive.filename.clone()
+    } else {
+        dest_path.display().to_string()
+    };
+
+    let result = PackResult {
+        name: archive.name.clone(),
+        version: archive.version.clone(),
+        filename: relative_filename,
+        files: archive
+            .files
+            .iter()
+            .map(|rel| FileEntry { path: rel.clone() })
+            .collect(),
+    };
+
+    if args.json {
+        // pnpm/npm return an array even for a single package; match that
+        // so `jq '.[0].filename'`-style consumers keep working.
+        let out = serde_json::to_string_pretty(&[&result]).into_diagnostic()?;
+        println!("{out}");
+    } else {
+        println!("package: {}@{}", result.name, result.version);
+        println!("Tarball Contents");
+        for f in &result.files {
+            println!("  {}", f.path);
+        }
+        println!("Tarball Details");
+        println!("  {}", result.filename);
+    }
+
+    Ok(())
+}
+
+/// Sanitize a package name into the tarball filename stem.
+/// `@scope/foo` -> `scope-foo`, `foo` -> `foo`.
+fn tarball_filename(name: &str, version: &str) -> String {
+    let sanitized = name.replace('@', "").replace('/', "-");
+    format!("{sanitized}-{version}.tgz")
+}
+
+#[derive(Debug)]
+struct PackedFile {
+    /// Absolute path on disk.
+    abs: PathBuf,
+    /// Forward-slash path relative to the project root. Becomes the
+    /// tarball entry name (prefixed with `package/` at write time).
+    rel: String,
+}
+
+/// In-memory result of packing a project. Reused by `aube publish`,
+/// which needs the tarball bytes to hash and upload.
+#[derive(Debug)]
+pub(crate) struct BuiltArchive {
+    pub name: String,
+    pub version: String,
+    /// Default tarball filename (`<sanitized-name>-<version>.tgz`).
+    pub filename: String,
+    /// Forward-slash project-relative paths included in the tarball.
+    pub files: Vec<String>,
+    /// Gzipped tar bytes, ready to write to disk or POST to a registry.
+    pub tarball: Vec<u8>,
+}
+
+/// Build a tarball for `project_dir` entirely in memory. Shared between
+/// `aube pack` (writes the bytes to disk) and the forthcoming
+/// `aube publish` (hashes and uploads them).
+pub(crate) fn build_archive(project_dir: &Path) -> miette::Result<BuiltArchive> {
+    let manifest = PackageJson::from_path(&project_dir.join("package.json"))
+        .into_diagnostic()
+        .wrap_err("failed to read package.json")?;
+    let name = manifest
+        .name
+        .as_deref()
+        .ok_or_else(|| miette!("pack: package.json has no `name` field"))?
+        .to_string();
+    let version = manifest
+        .version
+        .as_deref()
+        .ok_or_else(|| miette!("pack: package.json has no `version` field"))?
+        .to_string();
+
+    let files = collect_files(project_dir, &manifest)?;
+    let filename = tarball_filename(&name, &version);
+
+    let mut buf: Vec<u8> = Vec::new();
+    write_tarball(&files, &mut buf)?;
+
+    Ok(BuiltArchive {
+        name,
+        version,
+        filename,
+        files: files.into_iter().map(|f| f.rel).collect(),
+        tarball: buf,
+    })
+}
+
+/// Public-to-crate wrapper around `collect_files` that returns the
+/// selected `(abs, forward-slash rel)` entries. Used by the injected
+/// workspace dep materializer (`commands::inject`) so a packed snapshot
+/// of a workspace package can be copied into `.aube/` without
+/// round-tripping through an actual tarball.
+pub(crate) fn collect_package_files(
+    project_dir: &Path,
+    manifest: &PackageJson,
+) -> miette::Result<Vec<(PathBuf, String)>> {
+    let files = collect_files(project_dir, manifest)?;
+    Ok(files.into_iter().map(|f| (f.abs, f.rel)).collect())
+}
+
+fn collect_files(project_dir: &Path, manifest: &PackageJson) -> miette::Result<Vec<PackedFile>> {
+    let mut keep: BTreeSet<String> = BTreeSet::new();
+
+    if let Some(files_field) = manifest.extra.get("files")
+        && let Some(arr) = files_field.as_array()
+    {
+        for entry in arr {
+            let Some(pattern) = entry.as_str() else {
+                continue;
+            };
+            expand_files_glob(project_dir, pattern, &mut keep)?;
+        }
+    } else {
+        walk_with_ignores(project_dir, &mut keep)?;
+    }
+
+    // Always-on entries: npm/pnpm include these regardless of `files`
+    // or ignore rules. Skip silently when missing.
+    for always in always_included_files(project_dir, manifest) {
+        if project_dir.join(&always).is_file() {
+            keep.insert(always);
+        }
+    }
+
+    // `package.json` is mandatory.
+    if !keep.contains("package.json") && project_dir.join("package.json").is_file() {
+        keep.insert("package.json".to_string());
+    }
+
+    let mut out: Vec<PackedFile> = keep
+        .into_iter()
+        .map(|rel| PackedFile {
+            abs: project_dir.join(&rel),
+            rel,
+        })
+        .collect();
+    out.sort_by(|a, b| a.rel.cmp(&b.rel));
+    Ok(out)
+}
+
+/// Expand a glob from the `files` field, rooted at `project_dir`. If the
+/// pattern matches a directory, every non-ignored file underneath is added.
+fn expand_files_glob(
+    project_dir: &Path,
+    pattern: &str,
+    keep: &mut BTreeSet<String>,
+) -> miette::Result<()> {
+    let full_pattern = project_dir.join(pattern);
+    let matches = glob::glob(&full_pattern.to_string_lossy())
+        .map_err(|e| miette!("pack: invalid files glob {pattern:?}: {e}"))?;
+    for entry in matches {
+        let path = entry.map_err(|e| miette!("pack: glob walk failed: {e}"))?;
+        let Ok(rel) = path.strip_prefix(project_dir) else {
+            continue;
+        };
+        if path.is_dir() {
+            let mut sub: BTreeSet<String> = BTreeSet::new();
+            walk_subdir(project_dir, &path, &mut sub)?;
+            keep.extend(sub);
+        } else if path.is_file() {
+            keep.insert(normalize_rel(rel));
+        }
+    }
+    Ok(())
+}
+
+/// Recursive walk of `dir` collecting relative paths, respecting the
+/// standard npm ignore list. Used both for the no-`files` default and
+/// when a `files` entry points to a directory.
+fn walk_subdir(project_dir: &Path, dir: &Path, out: &mut BTreeSet<String>) -> miette::Result<()> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(it) => it,
+            Err(e) => {
+                return Err(miette!("pack: read_dir({}) failed: {e}", current.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to read {}", current.display()))?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if is_npm_ignored(&name) {
+                continue;
+            }
+            // `file_type()` doesn't follow symlinks, so symlinked
+            // directories are treated as leaves — avoids infinite loops
+            // on circular links like `src/self -> src/`.
+            let ft = entry
+                .file_type()
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to stat {}", path.display()))?;
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file()
+                && let Ok(rel) = path.strip_prefix(project_dir)
+            {
+                out.insert(normalize_rel(rel));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Top-level walker used when `files` is absent. Same as `walk_subdir`
+/// plus a root-level `.npmignore` / `.gitignore` check.
+fn walk_with_ignores(project_dir: &Path, out: &mut BTreeSet<String>) -> miette::Result<()> {
+    let ignore_lines = read_root_ignore(project_dir);
+    let mut collected: BTreeSet<String> = BTreeSet::new();
+    walk_subdir(project_dir, project_dir, &mut collected)?;
+    for rel in collected {
+        if ignore_lines
+            .iter()
+            .any(|line| matches_ignore_line(line, &rel))
+        {
+            continue;
+        }
+        out.insert(rel);
+    }
+    Ok(())
+}
+
+/// Read `.npmignore` (preferred) or `.gitignore` from the project root.
+/// Blank lines and comments are dropped.
+fn read_root_ignore(project_dir: &Path) -> Vec<String> {
+    let candidate = project_dir.join(".npmignore");
+    let candidate = if candidate.is_file() {
+        candidate
+    } else {
+        project_dir.join(".gitignore")
+    };
+    let Ok(content) = std::fs::read_to_string(&candidate) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
+
+/// Simple prefix/suffix/substring match against one .npmignore line.
+/// Not a full gitignore implementation — good enough for common patterns
+/// like `dist/`, `*.log`, `tests/`. Patterns that rely on `!` negation or
+/// nested globs are honored on a best-effort basis only.
+fn matches_ignore_line(line: &str, rel: &str) -> bool {
+    let line = line.trim_start_matches('/');
+    if let Some(ext) = line.strip_prefix("*.") {
+        return rel.ends_with(&format!(".{ext}"));
+    }
+    if let Some(prefix) = line.strip_suffix('/') {
+        return rel == prefix || rel.starts_with(&format!("{prefix}/"));
+    }
+    rel == line || rel.starts_with(&format!("{line}/"))
+}
+
+fn is_npm_ignored(name: &str) -> bool {
+    // Mirrors the hardcoded list in npm's `pack` implementation.
+    matches!(
+        name,
+        ".git"
+            | ".svn"
+            | ".hg"
+            | "CVS"
+            | ".DS_Store"
+            | "node_modules"
+            | "npm-debug.log"
+            | ".npmrc"
+            | ".npmignore"
+            | ".gitignore"
+            | "package-lock.json"
+            | "yarn.lock"
+            | "pnpm-lock.yaml"
+            | "bun.lock"
+            | "aube-lock.yaml"
+    ) || name.ends_with(".tgz")
+        || name.ends_with(".swp")
+}
+
+fn always_included_files(project_dir: &Path, manifest: &PackageJson) -> Vec<String> {
+    let mut out = vec!["package.json".to_string()];
+
+    // README, LICENSE, LICENCE, CHANGELOG — any extension.
+    let Ok(entries) = std::fs::read_dir(project_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let upper = name.to_uppercase();
+        let stem = upper
+            .rsplit_once('.')
+            .map(|(s, _)| s.to_string())
+            .unwrap_or(upper);
+        if matches!(
+            stem.as_str(),
+            "README" | "LICENSE" | "LICENCE" | "CHANGELOG"
+        ) {
+            out.push(name);
+        }
+    }
+
+    // `main` field entry. Strip any leading `./` so the path matches
+    // the walker's normalized form — otherwise `"./index.js"` becomes a
+    // second BTreeSet key alongside `"index.js"` and the file is packed
+    // twice (as `package/./index.js` and `package/index.js`).
+    if let Some(main) = manifest.extra.get("main").and_then(|v| v.as_str()) {
+        let cleaned = main.trim_start_matches("./");
+        if !cleaned.is_empty() {
+            out.push(cleaned.to_string());
+        }
+    }
+
+    out
+}
+
+fn normalize_rel(rel: &Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Write every packed file into `writer` as a gzipped tar with
+/// `package/<rel>` entries. All mtimes are pinned for reproducibility,
+/// matching pnpm/npm.
+fn write_tarball<W: Write>(files: &[PackedFile], writer: W) -> miette::Result<()> {
+    const REPRODUCIBLE_MTIME: u64 = 499_162_500; // 1985-10-26 08:15:00 UTC
+
+    let gz = GzEncoder::new(writer, Compression::default());
+    let mut builder = tar::Builder::new(gz);
+
+    for packed in files {
+        let data = std::fs::read(&packed.abs)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read {}", packed.abs.display()))?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(file_mode(&packed.abs));
+        header.set_mtime(REPRODUCIBLE_MTIME);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        let entry_name = format!("package/{}", packed.rel);
+        builder
+            .append_data(&mut header, &entry_name, data.as_slice())
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to add {entry_name} to tarball"))?;
+    }
+
+    let gz = builder
+        .into_inner()
+        .into_diagnostic()
+        .wrap_err("failed to finalize tar builder")?;
+    gz.finish()
+        .into_diagnostic()
+        .wrap_err("failed to finalize gzip stream")?;
+    Ok(())
+}
+
+/// Preserve the source file's executable bit so packages with `bin`
+/// scripts stay runnable after install: the store reads exec-ness from
+/// the tarball header (`mode & 0o111`), and the linker only chmods the
+/// symlink target when that bit is set.
+fn file_mode(path: &Path) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::metadata(path)
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0o644);
+        if perms & 0o111 != 0 { 0o755 } else { 0o644 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        0o644
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tarball_filename_unscoped() {
+        assert_eq!(tarball_filename("lodash", "4.17.21"), "lodash-4.17.21.tgz");
+    }
+
+    #[test]
+    fn tarball_filename_scoped() {
+        assert_eq!(
+            tarball_filename("@babel/core", "7.24.0"),
+            "babel-core-7.24.0.tgz"
+        );
+    }
+
+    #[test]
+    fn ignores_standard_dotfiles_and_lockfiles() {
+        assert!(is_npm_ignored("node_modules"));
+        assert!(is_npm_ignored(".git"));
+        assert!(is_npm_ignored("pnpm-lock.yaml"));
+        assert!(is_npm_ignored("aube-lock.yaml"));
+        assert!(is_npm_ignored("some-package-1.0.0.tgz"));
+        assert!(!is_npm_ignored("src"));
+    }
+
+    #[test]
+    fn ignore_line_matches_directories_and_suffixes() {
+        assert!(matches_ignore_line("dist/", "dist/main.js"));
+        assert!(matches_ignore_line("dist/", "dist"));
+        assert!(!matches_ignore_line("dist/", "distant/file"));
+        assert!(matches_ignore_line("*.log", "error.log"));
+        assert!(!matches_ignore_line("*.log", "error.txt"));
+    }
+}

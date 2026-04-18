@@ -1,0 +1,15 @@
+# Verdaccio cache state — hand-populated via the uplink-enabled config
+# documented in `test/registry/config.yaml` and committed for hermetic
+# offline BATS runs. Mark as generated so GitHub excludes it from the
+# language stats bar and collapses these files in PR diffs by default
+# (the individual packuments are hundreds of thousands of lines of
+# proxy JSON and would otherwise drown out every source diff).
+test/registry/storage/** linguist-generated=true
+
+# Golden file consumed by `crates/aube-cli/src/main.rs`'s
+# `usage_kdl_matches_committed_golden_file` test via `include_str!`.
+# Force LF regardless of the checkout platform's `core.autocrlf`
+# setting — Windows runners default to `autocrlf=true`, which would
+# otherwise embed CRLF into the binary and break the string-equality
+# check against `clap_usage::generate`'s LF output.
+aube.usage.kdl text eol=lf

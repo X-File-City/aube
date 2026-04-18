@@ -1,0 +1,29 @@
+[package]
+name = "aube-linker"
+description = "Isolated symlink layout linker for Aube"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+aube-store = { workspace = true }
+aube-lockfile = { workspace = true }
+xx = { workspace = true }
+log = { workspace = true }
+reflink-copy = { workspace = true }
+thiserror = { workspace = true }
+rayon = { workspace = true }
+pathdiff = "0.2"
+glob = { workspace = true }
+diffy = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+junction = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

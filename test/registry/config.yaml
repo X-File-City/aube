@@ -1,0 +1,27 @@
+# Verdaccio config for aube integration tests.
+#
+# Serves entirely from ./storage — no uplinks, no proxy. The storage dir
+# is committed to the repo with pre-seeded tarballs and packuments, so
+# the test suite runs without any network access to npmjs.org. To add a
+# new package to the fixture set:
+#
+#   1. Temporarily add `proxy: npmjs` back under packages[**] and an
+#      uplinks block pointing at https://registry.npmjs.org/.
+#   2. Run the test that needs the new package.
+#   3. Remove the uplink again, commit the new files under
+#      test/registry/storage/.
+
+storage: ./storage
+
+packages:
+  '**':
+    access: $all
+    publish: $all
+
+log:
+  type: stdout
+  format: pretty
+  level: error
+
+web:
+  enable: false

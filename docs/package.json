@@ -1,0 +1,11 @@
+{
+  "scripts": {
+    "settings:gen": "cargo run --manifest-path ../Cargo.toml -p aube-settings --bin generate-settings-docs",
+    "docs:dev": "npm run settings:gen && vitepress dev",
+    "docs:build": "npm run settings:gen && vitepress build",
+    "docs:preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "vitepress": "^1.5.0"
+  }
+}

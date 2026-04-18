@@ -1,0 +1,250 @@
+name: release-plz
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  # On every push to main: run `release-plz release`. If the current
+  # workspace version has no tag yet (because the release PR was just
+  # merged), this tags `aube-cli` as `v<version>`, opens a draft GitHub
+  # release, and publishes every workspace crate to crates.io in
+  # dependency order. Otherwise it's a no-op.
+  release-plz-release:
+    name: release-plz release
+    runs-on: ubuntu-latest
+    # Two commits landing on main in quick succession must not double-publish.
+    concurrency:
+      group: release-plz-release-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.AUBE_GH_TOKEN }}
+          submodules: recursive
+      - uses: Swatinem/rust-cache@v2
+      - name: Run release-plz
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.AUBE_GH_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      # The `releases` output is an array of every crate that was
+      # published, in dependency order. Since aube-cli depends on all
+      # 9 other internal crates, it is the LAST entry — and only it
+      # has `git_tag_enable = true` in release-plz.toml, so only its
+      # `.tag` is meaningful for downstream jobs. Pull that tag out by
+      # package name rather than by position.
+      - name: Extract aube-cli tag
+        id: tag
+        if: steps.release-plz.outputs.releases_created == 'true'
+        env:
+          RELEASES_JSON: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          TAG=$(echo "$RELEASES_JSON" | jq -r '.[] | select(.package_name == "aube-cli") | .tag')
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "::error::aube-cli was not in the releases output"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - name: Fetch new tags
+        if: steps.release-plz.outputs.releases_created == 'true'
+        run: git fetch --tags
+      # release-plz creates the draft release before pushing the tag,
+      # so the release API briefly has `tag_name: "untagged-<sha>"`.
+      # Patch the single aube-cli draft back to its real tag once it
+      # lands. (The other 9 crates have `git_release_enable = false`
+      # and don't create drafts.)
+      - name: Fix draft release tag
+        if: steps.release-plz.outputs.releases_created == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.AUBE_GH_TOKEN }}
+          REPO: ${{ github.repository }}
+          # jq reads `env.TAG` so a tag containing `"` or `\` can't
+          # break out of the jq query string.
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          echo "Looking for untagged draft release for tag: $TAG"
+          release_id=""
+          for attempt in $(seq 1 10); do
+            # Exact-match `.name == env.TAG` — `contains` would pick up
+            # stale drafts whose name is a superstring (e.g. a leftover
+            # `v1.0.0-beta.1` draft when TAG is `v1.0.0`). The draft
+            # name is set to "v{{ version }}" in release-plz.toml, so
+            # equality is the correct check.
+            release_id=$(gh api "repos/$REPO/releases" \
+              --jq '.[] | select(.draft and (.tag_name | startswith("untagged-"))) | select(.name == env.TAG) | .id' \
+              | head -1) || true
+            if [ -n "$release_id" ]; then
+              break
+            fi
+            echo "  Attempt $attempt/10: untagged draft not yet listed, retrying in 5s..."
+            sleep 5
+          done
+          if [ -n "$release_id" ]; then
+            echo "Patching draft release $release_id tag_name -> $TAG"
+            gh api "repos/$REPO/releases/$release_id" --method PATCH --field tag_name="$TAG"
+          else
+            echo "::warning::No untagged draft release found for $TAG after 10 attempts"
+          fi
+
+  # Build + codesign + upload release binaries for every target. Runs
+  # only when `release-plz-release` actually cut a release. The upload
+  # workflow is a reusable `workflow_call` so the matrix lives in one
+  # place.
+  upload-assets:
+    name: Upload assets
+    needs: release-plz-release
+    if: ${{ needs.release-plz-release.outputs.tag != '' }}
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release-plz-release.outputs.tag }}
+    secrets: inherit
+
+  # Flip the draft release to non-draft once assets are uploaded.
+  # `always()` means we still publish the release even if one target
+  # in the upload matrix failed — a partial-asset release is better
+  # than a permanent draft once crates.io has already been updated.
+  publish-release:
+    name: Publish release
+    needs: [release-plz-release, upload-assets]
+    if: ${{ always() && needs.release-plz-release.outputs.tag != '' && needs.release-plz-release.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.AUBE_GH_TOKEN }}
+          TAG: ${{ needs.release-plz-release.outputs.tag }}
+        run: |
+          gh release edit "$TAG" --repo "${{ github.repository }}" --draft=false
+
+  # Replace the raw git-cliff-style body with a communique-generated
+  # narrative release note. Non-fatal: if communique fails for any
+  # reason the published release still has the release-plz body.
+  enhance-release:
+    name: Enhance release notes
+    needs: [release-plz-release, publish-release]
+    if: ${{ needs.release-plz-release.outputs.tag != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.release-plz-release.outputs.tag }}
+          submodules: recursive
+      - uses: Swatinem/rust-cache@v2
+      - name: Install communique
+        run: cargo install communique --locked
+      - name: Enhance GitHub release with communique
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.AUBE_GH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TAG: ${{ needs.release-plz-release.outputs.tag }}
+        run: |
+          communique generate "$TAG" --github-release
+
+  # On every push to main: keep a running "chore: release" PR open with
+  # the next version bump + regenerated CHANGELOG. Merging the PR is
+  # what triggers the `release-plz-release` branch above on the next
+  # push.
+  release-plz-pr:
+    name: release-plz PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.AUBE_GH_TOKEN }}
+          submodules: recursive
+      - uses: jdx/mise-action@v2
+      - uses: Swatinem/rust-cache@v2
+      - name: Run release-plz
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.AUBE_GH_TOKEN }}
+      # When release-plz opens or updates a release PR, regenerate the
+      # usage-spec/CLI docs to match the new version, rewrite the PR
+      # body with communique-generated release notes, and squash.
+      # release-plz sets `prs_created=true` on both initial create and
+      # subsequent updates (it's "there are PRs this run"), so this
+      # condition fires on every run that touches the release PR.
+      - name: Update release PR
+        if: steps.release-plz.outputs.prs_created == 'true'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.AUBE_GH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Route JSON through env vars — never inline `${{ ... }}`
+          # into shell because single-quotes in the output would break
+          # out of the `echo '...'` string boundary.
+          PRS_JSON: ${{ steps.release-plz.outputs.prs }}
+        run: |
+          # `prs` is the supported output (a JSON array); `pr` is
+          # deprecated. Take the first entry — release-plz only ever
+          # opens one release PR at a time.
+          PR_NUMBER=$(echo "$PRS_JSON" | jq -r '.[0].number')
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
+            echo "::error::release-plz did not emit a PR number"
+            exit 1
+          fi
+
+          # actions/checkout doesn't set a git identity and we're about
+          # to create a commit below — set it now so `git commit`
+          # doesn't fail with "Please tell me who you are".
+          git config user.name "release-plz[bot]"
+          git config user.email "release-plz+bot@users.noreply.github.com"
+
+          gh pr checkout "$PR_NUMBER"
+
+          # Regenerate CLI usage + lint fixes so the release PR matches
+          # the new version.
+          mise run render ::: lint-fix
+
+          cargo install communique --locked
+          VERSION=$(cargo metadata --format-version=1 --no-deps \
+            | jq -r '.packages[] | select(.name == "aube-cli") | .version')
+          TAG="v${VERSION}"
+
+          FULL_NOTES=$(communique generate "$TAG" --changelog || true)
+
+          if [ -n "$FULL_NOTES" ]; then
+            PR_TITLE=$(echo "$FULL_NOTES" | head -1 | sed 's/^# //')
+            PR_BODY=$(echo "$FULL_NOTES" | tail -n +3)
+            gh pr edit "$PR_NUMBER" --title "$PR_TITLE" --body "$PR_BODY"
+          fi
+
+          # Squash any rendered-doc / communique-changelog changes
+          # onto the release-plz commit so the PR stays one commit.
+          # Use `-A` on the paths the `render` task writes to, so NEW
+          # files (e.g. docs/cli/<new-subcommand>.md after `docs/cli`
+          # is regenerated from scratch) are picked up — `git add -u`
+          # would silently omit them.
+          git add -A aube.usage.kdl docs CHANGELOG.md Cargo.toml Cargo.lock crates
+          MERGE_BASE=$(git merge-base HEAD origin/main)
+          git reset --soft "$MERGE_BASE"
+          git commit -m "chore: release ${TAG}"
+          git push --force-with-lease

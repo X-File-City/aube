@@ -1,0 +1,325 @@
+#!/usr/bin/env bats
+
+setup() {
+	load 'test_helper/common_setup'
+	_common_setup
+}
+
+teardown() {
+	_common_teardown
+}
+
+_setup_filter_workspace() {
+	cat >pnpm-workspace.yaml <<-EOF
+		packages:
+		  - packages/*
+	EOF
+	cat >package.json <<-'EOF'
+		{"name": "root", "version": "0.0.0", "private": true}
+	EOF
+	mkdir -p packages/lib-a packages/lib-b packages/other
+	cat >packages/lib-a/package.json <<-'EOF'
+		{
+		  "name": "@scope/lib-a",
+		  "version": "1.0.0",
+		  "dependencies": { "@scope/lib-b": "workspace:*" },
+		  "scripts": { "hello": "echo lib-a-ran" }
+		}
+	EOF
+	cat >packages/lib-b/package.json <<-'EOF'
+		{
+		  "name": "@scope/lib-b",
+		  "version": "1.0.0",
+		  "scripts": { "hello": "echo lib-b-ran" }
+		}
+	EOF
+	cat >packages/other/package.json <<-'EOF'
+		{
+		  "name": "other",
+		  "version": "1.0.0",
+		  "scripts": { "hello": "echo other-ran" }
+		}
+	EOF
+}
+
+@test "aube -F run: exact-name selector runs script in one package" {
+	_setup_filter_workspace
+	run aube -F @scope/lib-a run hello
+	assert_success
+	assert_output --partial "lib-a-ran"
+	refute_output --partial "lib-b-ran"
+	refute_output --partial "other-ran"
+}
+
+@test "aube -F run: glob selector fans out to multiple packages" {
+	_setup_filter_workspace
+	run aube -F '@scope/*' run hello
+	assert_success
+	assert_output --partial "lib-a-ran"
+	assert_output --partial "lib-b-ran"
+	refute_output --partial "other-ran"
+}
+
+@test "aube -F run: dependency graph selector includes workspace deps" {
+	_setup_filter_workspace
+	run aube -F '@scope/lib-a...' run hello
+	assert_success
+	assert_output --partial "lib-a-ran"
+	assert_output --partial "lib-b-ran"
+	refute_output --partial "other-ran"
+}
+
+@test "aube -F run: dependency graph selector can exclude the seed" {
+	_setup_filter_workspace
+	run aube -F '@scope/lib-a^...' run hello
+	assert_success
+	refute_output --partial "lib-a-ran"
+	assert_output --partial "lib-b-ran"
+	refute_output --partial "other-ran"
+}
+
+@test "aube -F run: dependent graph selector includes workspace dependents" {
+	_setup_filter_workspace
+	run aube -F '...@scope/lib-b' run hello
+	assert_success
+	assert_output --partial "lib-a-ran"
+	assert_output --partial "lib-b-ran"
+	refute_output --partial "other-ran"
+}
+
+@test "aube -F run: exclusion selector subtracts from recursive match" {
+	_setup_filter_workspace
+	run aube -F '*' -F '!@scope/lib-b' run hello
+	assert_success
+	assert_output --partial "lib-a-ran"
+	refute_output --partial "lib-b-ran"
+	assert_output --partial "other-ran"
+}
+
+@test "aube -F run: exclusion selector is order independent" {
+	_setup_filter_workspace
+	run aube -F '!@scope/lib-b' -F '*' run hello
+	assert_success
+	assert_output --partial "lib-a-ran"
+	refute_output --partial "lib-b-ran"
+	assert_output --partial "other-ran"
+}
+
+@test "aube -F run: git-ref selector matches committed changed packages" {
+	_setup_filter_workspace
+	git init
+	git -c user.email=test@example.com -c user.name=Test add -A
+	git -c user.email=test@example.com -c user.name=Test commit -m init
+
+	echo "// committed change" >>packages/lib-a/index.js
+	git -c user.email=test@example.com -c user.name=Test add packages/lib-a/index.js
+	git -c user.email=test@example.com -c user.name=Test commit -m "change lib-a"
+	echo "// uncommitted change" >>packages/lib-b/index.js
+
+	run aube -F '[HEAD~1]' run hello
+	assert_success
+	assert_output --partial "lib-a-ran"
+	refute_output --partial "lib-b-ran"
+	refute_output --partial "other-ran"
+}
+
+@test "aube -F run: git-ref selector works in nested git repo workspace" {
+	git init
+	mkdir frontend
+	(
+		cd frontend
+		_setup_filter_workspace
+	)
+	git -c user.email=test@example.com -c user.name=Test add -A
+	git -c user.email=test@example.com -c user.name=Test commit -m init
+
+	echo "// committed change" >>frontend/packages/lib-a/index.js
+	git -c user.email=test@example.com -c user.name=Test add frontend/packages/lib-a/index.js
+	git -c user.email=test@example.com -c user.name=Test commit -m "change lib-a"
+
+	(
+		cd frontend
+		run aube -F '[HEAD~1]' run hello
+		assert_success
+		assert_output --partial "lib-a-ran"
+		refute_output --partial "lib-b-ran"
+		refute_output --partial "other-ran"
+	)
+}
+
+@test "aube -F run: path selector matches directory prefix" {
+	_setup_filter_workspace
+	run aube --filter ./packages/lib-b run hello
+	assert_success
+	assert_output --partial "lib-b-ran"
+	refute_output --partial "lib-a-ran"
+}
+
+@test "aube -F run: unmatched selector errors" {
+	_setup_filter_workspace
+	run aube -F no-such-pkg run hello
+	assert_failure
+	assert_output --partial "did not match"
+}
+
+@test "aube -F run: shortcut commands honor filter" {
+	_setup_filter_workspace
+	# `hello` is not a shortcut; use the implicit-script path via `aube hello`,
+	# which routes through run_script and should pick up --filter too.
+	run aube -F @scope/lib-a hello
+	assert_success
+	assert_output --partial "lib-a-ran"
+	refute_output --partial "lib-b-ran"
+}
+
+@test "aube -r run: fans out to every workspace package" {
+	_setup_filter_workspace
+	run aube -r run hello
+	assert_success
+	assert_output --partial "lib-a-ran"
+	assert_output --partial "lib-b-ran"
+	assert_output --partial "other-ran"
+}
+
+@test "aube --recursive run: long form matches short" {
+	_setup_filter_workspace
+	run aube --recursive run hello
+	assert_success
+	assert_output --partial "lib-a-ran"
+	assert_output --partial "lib-b-ran"
+	assert_output --partial "other-ran"
+}
+
+@test "aube recursive run: wrapper form fans out to every workspace package" {
+	_setup_filter_workspace
+	run aube recursive run hello
+	assert_success
+	assert_output --partial "lib-a-ran"
+	assert_output --partial "lib-b-ran"
+	assert_output --partial "other-ran"
+}
+
+@test "aube recursive run: wrapper preserves explicit filter" {
+	_setup_filter_workspace
+	run aube -F @scope/lib-a recursive run hello
+	assert_success
+	assert_output --partial "lib-a-ran"
+	refute_output --partial "lib-b-ran"
+	refute_output --partial "other-ran"
+}
+
+@test "aube -r: explicit filter wins over recursive" {
+	_setup_filter_workspace
+	run aube -r -F @scope/lib-a run hello
+	assert_success
+	assert_output --partial "lib-a-ran"
+	refute_output --partial "lib-b-ran"
+	refute_output --partial "other-ran"
+}
+
+@test "aube -r: implicit script fanout" {
+	_setup_filter_workspace
+	run aube -r hello
+	assert_success
+	assert_output --partial "lib-a-ran"
+	assert_output --partial "lib-b-ran"
+	assert_output --partial "other-ran"
+}
+
+@test "aube -F update: --global no-op still preserves workspace filter" {
+	_setup_filter_workspace
+	node -e "const fs=require('fs'); const p=JSON.parse(fs.readFileSync('packages/lib-a/package.json')); p.dependencies={'is-odd':'^0.1.0'}; fs.writeFileSync('packages/lib-a/package.json', JSON.stringify(p, null, 2));"
+
+	run aube -F @scope/lib-a update --global is-odd
+	assert_success
+}
+
+# --filter-prod tests: the workspace below gives api a prod edge to lib
+# and a dev-only edge to tooling. `--filter-prod 'api...'` must skip the
+# dev edge, so the graph walk reaches lib but not tooling. Exact-name
+# and glob selectors ignore edges entirely, so they match pnpm's
+# `--filter-prod` behavior of treating the non-graph forms the same as
+# `--filter`.
+_setup_filter_prod_workspace() {
+	cat >pnpm-workspace.yaml <<-EOF
+		packages:
+		  - packages/*
+	EOF
+	cat >package.json <<-'EOF'
+		{"name": "root", "version": "0.0.0", "private": true}
+	EOF
+	mkdir -p packages/api packages/lib packages/tooling
+	cat >packages/api/package.json <<-'EOF'
+		{
+		  "name": "@scope/api",
+		  "version": "1.0.0",
+		  "dependencies": { "@scope/lib": "workspace:*" },
+		  "devDependencies": { "@scope/tooling": "workspace:*" },
+		  "scripts": { "hello": "echo api-ran" }
+		}
+	EOF
+	cat >packages/lib/package.json <<-'EOF'
+		{
+		  "name": "@scope/lib",
+		  "version": "1.0.0",
+		  "scripts": { "hello": "echo lib-ran" }
+		}
+	EOF
+	cat >packages/tooling/package.json <<-'EOF'
+		{
+		  "name": "@scope/tooling",
+		  "version": "1.0.0",
+		  "scripts": { "hello": "echo tooling-ran" }
+		}
+	EOF
+}
+
+@test "aube --filter-prod: graph selector skips devDependencies edges" {
+	_setup_filter_prod_workspace
+	run aube --filter-prod '@scope/api...' run hello
+	assert_success
+	assert_output --partial "api-ran"
+	assert_output --partial "lib-ran"
+	refute_output --partial "tooling-ran"
+}
+
+@test "aube --filter: graph selector follows devDependencies edges" {
+	_setup_filter_prod_workspace
+	run aube -F '@scope/api...' run hello
+	assert_success
+	assert_output --partial "api-ran"
+	assert_output --partial "lib-ran"
+	assert_output --partial "tooling-ran"
+}
+
+@test "aube --filter-prod: dependents walk skips devDependencies edges" {
+	_setup_filter_prod_workspace
+	# tooling is only pulled in through api's devDependencies, so a
+	# prod-only reverse walk from tooling shouldn't reach api.
+	run aube --filter-prod '...@scope/tooling' run hello
+	assert_success
+	assert_output --partial "tooling-ran"
+	refute_output --partial "api-ran"
+	refute_output --partial "lib-ran"
+}
+
+@test "aube --filter-prod: exact-name selector behaves like --filter" {
+	_setup_filter_prod_workspace
+	run aube --filter-prod '@scope/api' run hello
+	assert_success
+	assert_output --partial "api-ran"
+	refute_output --partial "lib-ran"
+	refute_output --partial "tooling-ran"
+}
+
+@test "aube --filter-prod: combines with --filter (union)" {
+	_setup_filter_prod_workspace
+	# --filter-prod 'api...' → api + lib (dev edge skipped)
+	# --filter 'tooling'     → tooling
+	# union should run all three scripts.
+	run aube --filter-prod '@scope/api...' --filter '@scope/tooling' run hello
+	assert_success
+	assert_output --partial "api-ran"
+	assert_output --partial "lib-ran"
+	assert_output --partial "tooling-ran"
+}

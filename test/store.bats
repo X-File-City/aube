@@ -1,0 +1,114 @@
+#!/usr/bin/env bats
+
+setup() {
+	load 'test_helper/common_setup'
+	_common_setup
+}
+
+teardown() {
+	_common_teardown
+}
+
+@test "aube store --help lists every subcommand" {
+	run aube store --help
+	assert_success
+	assert_output --partial "path"
+	assert_output --partial "prune"
+	assert_output --partial "status"
+	assert_output --partial "add"
+}
+
+@test "aube store path prints an aube-store path under HOME" {
+	run aube store path
+	assert_success
+	assert_output --partial ".aube-store"
+	# HOME is isolated to the test temp dir, so the store path must live
+	# inside it — proves path() honors $HOME and isn't hardcoded.
+	assert_output --partial "$HOME"
+}
+
+@test "aube store path honors store-dir from .npmrc and appends v1/files" {
+	mkdir -p custom-store
+	echo "store-dir=$PWD/custom-store" >.npmrc
+	run aube store path
+	assert_success
+	# aube appends its own CAS schema suffix (`v1/files`) to the
+	# user-supplied store-dir. The suffix exists so the on-disk layout
+	# is stable across versions of aube and never collides with a pnpm
+	# store rooted at the same path.
+	assert_output "$PWD/custom-store/v1/files"
+}
+
+@test "aube store path honors storeDir from pnpm-workspace.yaml" {
+	mkdir -p ws-store
+	cat >pnpm-workspace.yaml <<EOF
+storeDir: $PWD/ws-store
+EOF
+	run aube store path
+	assert_success
+	assert_output "$PWD/ws-store/v1/files"
+}
+
+@test "aube store path expands ~ in store-dir to \$HOME" {
+	echo 'store-dir=~/custom-home-store' >.npmrc
+	run aube store path
+	assert_success
+	assert_output "$HOME/custom-home-store/v1/files"
+}
+
+@test "aube store add fetches a package and subsequent install is warm" {
+	# Pre-warm the store with is-odd; then the basic fixture install should
+	# find it cached and fetch only the missing packages.
+	run aube store add is-odd@3.0.1
+	assert_success
+	assert_output --partial "is-odd@3.0.1"
+
+	# The cached index should exist for the added package.
+	assert_file_exists "$HOME/.cache/aube/index/is-odd@3.0.1.json"
+
+	# Also sanity-check `store status` returns clean after an add.
+	run aube store status
+	assert_success
+	assert_output --partial "consistent"
+}
+
+@test "aube store add rejects unknown packages" {
+	run aube store add this-package-does-not-exist-xyz
+	assert_failure
+	assert_output --partial "not found"
+}
+
+@test "aube store status detects a corrupted file" {
+	run aube store add is-odd@3.0.1
+	assert_success
+
+	# Pick one of the files the cached index points at and corrupt it.
+	index="$HOME/.cache/aube/index/is-odd@3.0.1.json"
+	store_path="$(grep -o '"store_path":"[^"]*"' "$index" | head -n1 | sed 's/.*":"//;s/"$//')"
+	echo "garbage" >"$store_path"
+
+	run aube store status
+	assert_failure
+	assert_output --partial "corrupt"
+}
+
+@test "aube store prune runs cleanly on an empty store" {
+	run aube store prune
+	assert_success
+	assert_output --partial "empty"
+}
+
+@test "aube store prune actually deletes unreferenced files" {
+	run aube store add is-odd@3.0.1
+	assert_success
+
+	# Drop the cached index so every file the `add` just wrote becomes
+	# unreferenced. Without this the prune loop would `continue` on every
+	# file and never exercise the deletion branch.
+	rm "$HOME/.cache/aube/index/is-odd@3.0.1.json"
+
+	run aube store prune
+	assert_success
+	assert_output --partial "Pruned"
+	refute_output --partial "Pruned 0 files"
+}

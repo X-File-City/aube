@@ -1,0 +1,65 @@
+[env]
+_.path = ["./bin"]
+
+[tools]
+hk = "latest"
+pkl = "latest"
+pitchfork = "latest"
+shellcheck = "latest"
+shfmt = "latest"
+actionlint = "latest"
+node = "24"
+usage = "latest"
+
+[tasks.lint]
+run = "hk check --all --slow"
+
+[tasks.lint-fix]
+run = "hk fix --all --slow"
+
+[tasks.build]
+run = "cargo build"
+
+[tasks.test]
+run = "cargo test"
+
+[tasks."docs:dev"]
+depends = ["build"]
+dir = "docs"
+run = "../target/debug/aube install && exec ../target/debug/aube run docs:dev"
+
+[tasks."docs:build"]
+depends = ["build"]
+dir = "docs"
+run = "../target/debug/aube install && exec ../target/debug/aube run docs:build"
+
+[tasks.bench]
+dir = "{{config_root}}"
+run = [
+  "cargo build --release",
+  "mise x aqua:sharkdp/hyperfine@latest aqua:pnpm/pnpm@latest npm:yarn@1 bun@latest node@24 -- bash benchmarks/bench.sh",
+]
+
+# Regenerate `benchmarks/results.json` (and the markdown summary) by
+# re-running the full hyperfine scenario matrix with a release build
+# and 10 runs × 3 warmups, then writing the structured output into
+# the repo in-place. Commit the updated JSON and the chart on the
+# VitePress benchmarks page picks it up automatically — the page's
+# data loader at `docs/benchmarks.data.ts` reads it at build time.
+[tasks."bench:bump"]
+dir = "{{config_root}}"
+env = { RUNS = "10", WARMUP = "3", RESULTS_JSON = "{{config_root}}/benchmarks/results.json" }
+run = [
+  "cargo build --release",
+  "mise x aqua:sharkdp/hyperfine@latest aqua:pnpm/pnpm@latest npm:yarn@1 bun@latest node@24 -- bash benchmarks/bench.sh",
+]
+
+[tasks.render]
+depends = ["build"]
+run = [
+  "./target/debug/aube usage > aube.usage.kdl",
+  "rm -rf docs/cli && mkdir -p docs/cli",
+  "usage g markdown -mf aube.usage.kdl --out-dir docs/cli --url-prefix /cli",
+  "usage g json -f aube.usage.kdl > docs/cli/commands.json",
+  "cargo run -p aube-settings --bin generate-settings-docs",
+]

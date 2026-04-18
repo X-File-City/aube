@@ -1,0 +1,25 @@
+[package]
+name = "aube-lockfile"
+description = "Multi-format lockfile reader/writer for Aube (aube-lock, pnpm-lock, package-lock, yarn.lock, bun.lock)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+aube-manifest = { workspace = true }
+aube-settings = { workspace = true }
+glob = { workspace = true }
+node-semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

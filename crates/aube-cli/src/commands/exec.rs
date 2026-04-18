@@ -1,0 +1,300 @@
+use super::ensure_installed;
+use clap::Args;
+use miette::{Context, IntoDiagnostic, miette};
+use std::path::Path;
+
+#[derive(Debug, Args)]
+pub struct ExecArgs {
+    /// Binary name
+    pub bin: String,
+    /// Arguments to pass to the binary
+    #[arg(trailing_var_arg = true)]
+    pub args: Vec<String>,
+    /// Continue recursive execution after a command fails.
+    ///
+    /// Parsed for pnpm compatibility; aube currently stops on the
+    /// first failure.
+    #[arg(long)]
+    pub no_bail: bool,
+    /// Skip auto-install check
+    #[arg(long)]
+    pub no_install: bool,
+    /// Disable topological sorting.
+    ///
+    /// Parsed for pnpm compatibility.
+    #[arg(long, overrides_with = "sort")]
+    pub no_sort: bool,
+    /// Run recursive workspace executions concurrently.
+    #[arg(long)]
+    pub parallel: bool,
+    /// Write a recursive exec summary file.
+    ///
+    /// Parsed for pnpm compatibility.
+    #[arg(long)]
+    pub report_summary: bool,
+    /// Hide package prefixes in recursive reporter output.
+    ///
+    /// Parsed for pnpm compatibility.
+    #[arg(long)]
+    pub reporter_hide_prefix: bool,
+    /// Resume recursive execution from a package name.
+    ///
+    /// Parsed for pnpm compatibility.
+    #[arg(long, value_name = "PACKAGE")]
+    pub resume_from: Option<String>,
+    /// Run recursive packages in reverse order.
+    ///
+    /// Parsed for pnpm compatibility.
+    #[arg(long)]
+    pub reverse: bool,
+    /// Run the command through `sh -c`.
+    #[arg(short = 'c', long)]
+    pub shell_mode: bool,
+    /// Sort recursive packages topologically.
+    ///
+    /// Parsed for pnpm compatibility.
+    #[arg(long, overrides_with = "no_sort")]
+    pub sort: bool,
+    /// Recursive workspace concurrency.
+    ///
+    /// Parsed for pnpm compatibility.
+    #[arg(long, value_name = "N")]
+    pub workspace_concurrency: Option<usize>,
+}
+
+pub async fn run(
+    exec_args: ExecArgs,
+    filter: aube_workspace::selector::EffectiveFilter,
+) -> miette::Result<()> {
+    let ExecArgs {
+        bin,
+        args,
+        no_install,
+        parallel,
+        no_bail: _,
+        no_sort: _,
+        report_summary: _,
+        reporter_hide_prefix: _,
+        resume_from: _,
+        reverse: _,
+        shell_mode,
+        sort: _,
+        workspace_concurrency: _,
+    } = exec_args;
+    let cwd = crate::dirs::project_root()?;
+
+    ensure_installed(no_install).await?;
+
+    if !filter.is_empty() {
+        return run_filtered(&cwd, &bin, &args, shell_mode, parallel, &filter).await;
+    }
+
+    let bin_path = super::project_modules_dir(&cwd).join(".bin").join(&bin);
+    exec_bin(&cwd, &bin_path, &bin, &args, shell_mode).await
+}
+
+async fn run_filtered(
+    cwd: &Path,
+    bin: &str,
+    args: &[String],
+    shell_mode: bool,
+    parallel: bool,
+    filter: &aube_workspace::selector::EffectiveFilter,
+) -> miette::Result<()> {
+    let matched = super::select_workspace_packages(cwd, filter, "exec")?;
+    if parallel {
+        if !shell_mode {
+            for pkg in &matched {
+                let bin_path = super::project_modules_dir(&pkg.dir).join(".bin").join(bin);
+                if !bin_path.exists() {
+                    let name = pkg
+                        .name
+                        .as_deref()
+                        .unwrap_or_else(|| pkg.dir.to_str().unwrap_or("<unknown>"));
+                    return Err(miette!(
+                        "binary not found in {name}: {bin}\nTry running `aube install` first, or check that the package providing '{bin}' is in its dependencies."
+                    ));
+                }
+            }
+        }
+
+        let mut tasks: Vec<tokio::task::JoinHandle<miette::Result<std::process::ExitStatus>>> =
+            Vec::with_capacity(matched.len());
+        let mut task_names = Vec::with_capacity(matched.len());
+        for pkg in matched {
+            let name = pkg
+                .name
+                .clone()
+                .unwrap_or_else(|| pkg.dir.display().to_string());
+            let bin_path = super::project_modules_dir(&pkg.dir).join(".bin").join(bin);
+            let dir = pkg.dir.clone();
+            let bin = bin.to_string();
+            let args = args.to_vec();
+            task_names.push(name);
+            tasks.push(tokio::spawn(async move {
+                exec_bin_status(&dir, &bin_path, &bin, &args, shell_mode).await
+            }));
+        }
+
+        let mut first_err: Option<miette::Report> = None;
+        let mut first_exit: Option<i32> = None;
+        for (task, name) in tasks.into_iter().zip(task_names) {
+            match task.await {
+                Ok(Ok(status)) => {
+                    if !status.success() && first_exit.is_none() {
+                        let code = status.code().unwrap_or(1);
+                        first_exit = Some(code);
+                        first_err =
+                            Some(miette!("aube exec: `{bin}` failed in {name} (exit {code})"));
+                    }
+                }
+                Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
+                Ok(Err(_)) => {}
+                Err(e) if first_err.is_none() => first_err = Some(miette!("task panicked: {e}")),
+                Err(_) => {}
+            }
+        }
+        if let Some(code) = first_exit {
+            std::process::exit(code);
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        return Ok(());
+    }
+
+    for pkg in matched {
+        let bin_path = super::project_modules_dir(&pkg.dir).join(".bin").join(bin);
+        exec_bin(&pkg.dir, &bin_path, bin, args, shell_mode).await?;
+    }
+    Ok(())
+}
+
+async fn exec_bin(
+    cwd: &Path,
+    bin_path: &Path,
+    bin: &str,
+    args: &[String],
+    shell_mode: bool,
+) -> miette::Result<()> {
+    if !shell_mode && !bin_path.exists() {
+        return Err(miette!(
+            "binary not found: {bin}\nTry running `aube install` first, or check that the package providing '{bin}' is in your dependencies."
+        ));
+    }
+
+    let mut command = if shell_mode {
+        let line = std::iter::once(shell_quote(bin))
+            .chain(args.iter().map(|arg| shell_quote(arg)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let bin_dir = super::project_modules_dir(cwd).join(".bin");
+        let new_path = aube_scripts::prepend_path(&bin_dir);
+        let mut cmd = aube_scripts::spawn_shell(&line);
+        cmd.env("PATH", &new_path);
+        cmd
+    } else {
+        let mut cmd = tokio::process::Command::new(bin_path);
+        cmd.args(args);
+        cmd
+    };
+    let status = command
+        .current_dir(cwd)
+        .stderr(aube_scripts::child_stderr())
+        .status()
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to execute binary")?;
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    Ok(())
+}
+
+async fn exec_bin_status(
+    cwd: &Path,
+    bin_path: &Path,
+    bin: &str,
+    args: &[String],
+    shell_mode: bool,
+) -> miette::Result<std::process::ExitStatus> {
+    if !shell_mode && !bin_path.exists() {
+        return Err(miette!(
+            "binary not found: {bin}\nTry running `aube install` first, or check that the package providing '{bin}' is in your dependencies."
+        ));
+    }
+
+    let mut command = if shell_mode {
+        let line = std::iter::once(shell_quote(bin))
+            .chain(args.iter().map(|arg| shell_quote(arg)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let bin_dir = super::project_modules_dir(cwd).join(".bin");
+        let new_path = aube_scripts::prepend_path(&bin_dir);
+        let mut cmd = aube_scripts::spawn_shell(&line);
+        cmd.env("PATH", &new_path);
+        cmd
+    } else {
+        let mut cmd = tokio::process::Command::new(bin_path);
+        cmd.args(args);
+        cmd
+    };
+    command
+        .current_dir(cwd)
+        .stderr(aube_scripts::child_stderr())
+        .status()
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to execute binary")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value.bytes().all(|byte| {
+        matches!(
+            byte,
+            b'A'..=b'Z'
+                | b'a'..=b'z'
+                | b'0'..=b'9'
+                | b'_'
+                | b'-'
+                | b'.'
+                | b'/'
+                | b':'
+                | b'@'
+                | b'%'
+                | b'+'
+                | b','
+                | b'='
+        )
+    }) {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote;
+
+    #[test]
+    fn shell_quote_leaves_safe_values_unquoted() {
+        assert_eq!(
+            shell_quote("/tmp/node_modules/.bin/vite"),
+            "/tmp/node_modules/.bin/vite"
+        );
+        assert_eq!(shell_quote("@scope/pkg-name"), "@scope/pkg-name");
+    }
+
+    #[test]
+    fn shell_quote_quotes_special_values() {
+        assert_eq!(shell_quote("two words"), "'two words'");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("can't"), "'can'\\''t'");
+    }
+}

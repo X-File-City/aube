@@ -1,0 +1,836 @@
+//! `aube publish` — upload the current project's tarball to a registry.
+//!
+//! Builds the same in-memory archive as `aube pack`, then issues an npm
+//! PUT request to `{registry}/{name}`. The body shape matches what npm and
+//! pnpm produce: a single-version packument containing the manifest under
+//! `versions.<v>`, a `dist-tags` map, and the tarball base64-encoded under
+//! `_attachments`. The registry stores the tarball at the URL named in
+//! `versions.<v>.dist.tarball` and indexes it by `shasum` (SHA-1 hex) and
+//! `integrity` (SHA-512 SRI) exactly like `npm publish`.
+//!
+//! Auth and per-registry TLS come from `.npmrc` via `RegistryClient`, so
+//! `aube login` and pre-existing per-registry auth entries both work.
+//! Scoped packages are routed through their scope's registry when configured.
+//!
+//! This cut implements the P1 subset from `CLI_SPEC.md`:
+//! `--tag`, `--access`, `--dry-run`, `--registry`, `--otp`, `--no-git-checks`,
+//! `--force`, `--provenance`, plus workspace fanout via the global
+//! `-r` / `--filter`.
+//!
+//! Workspace fanout (`-r` / `-F`) discovers packages from
+//! `pnpm-workspace.yaml`, skips any with `"private": true`, optionally
+//! narrows by exact `--filter=<name>` matches (repeatable), and for each
+//! survivor checks whether `name@version` already exists on the target
+//! registry. Matches are silently skipped so `aube -r publish` is
+//! re-runnable after a partial success — this matches pnpm's
+//! "publish what's changed" semantics without the git-diff dance.
+//! `--force` bypasses both the per-package skip and the single-package
+//! "already published" error, leaving the registry itself to decide
+//! whether a republish is allowed.
+
+use crate::commands::pack::{BuiltArchive, build_archive};
+use crate::commands::{encode_package_name, ensure_registry_auth};
+use aube_manifest::PackageJson;
+use aube_registry::client::RegistryClient;
+use aube_registry::config::{NpmConfig, normalize_registry_url_pub};
+use base64::Engine;
+use clap::Args;
+use miette::{Context, IntoDiagnostic, miette};
+use sha1::Digest as _;
+use sha2::Sha512;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Args)]
+pub struct PublishArgs {
+    /// Publish as `public` or `restricted`.
+    ///
+    /// Sent as the `access` field in the publish body; scoped
+    /// packages default to `restricted` on the registry side, so
+    /// pass `--access=public` to make a new scoped package
+    /// world-readable.
+    #[arg(long, value_name = "LEVEL")]
+    pub access: Option<String>,
+    /// Don't upload; print what would be published.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Republish `name@version` even when that version is already on
+    /// the target registry.
+    ///
+    /// By default `aube publish` issues a GET before the PUT and
+    /// refuses to proceed when the version exists, surfacing a clear
+    /// error instead of relying on the registry to return 409. In
+    /// `--recursive` / `--filter` mode, `--force` overrides the
+    /// silent "already-published" skip so every selected workspace
+    /// package is re-PUT. The registry must still accept the
+    /// republish — npm's public registry rejects re-publishes
+    /// outright; Verdaccio and most private mirrors allow them.
+    #[arg(long)]
+    pub force: bool,
+    /// Skip `prepublishOnly` / `prepack` / `postpack` / `publish` /
+    /// `postpublish` lifecycle scripts for this publish.
+    ///
+    /// Accepted for pnpm parity; aube's publish path does not run
+    /// those scripts today, so this is a no-op kept for wrapper
+    /// compatibility.
+    #[arg(long)]
+    pub ignore_scripts: bool,
+    /// Emit the publish result as JSON: an array with one
+    /// `{name, version, filename, files: [{path}]}` entry, matching
+    /// `pnpm publish --json` / `aube pack --json`.
+    #[arg(long)]
+    pub json: bool,
+    /// Skip the "working tree must be clean" check.
+    ///
+    /// When unset, aube refuses to publish from a dirty git checkout
+    /// (uncommitted tracked changes) or from a detached / non-release
+    /// branch.
+    #[arg(long)]
+    pub no_git_checks: bool,
+    /// One-time password for registries that require 2FA.
+    ///
+    /// Sent verbatim as the `npm-otp` header.
+    #[arg(long, value_name = "CODE")]
+    pub otp: Option<String>,
+    /// Generate a SLSA provenance attestation and attach it to the publish
+    /// body.
+    ///
+    /// Requires an OIDC-capable CI environment (GitHub Actions with
+    /// `id-token: write`, GitLab CI, Buildkite, or CircleCI) — aube
+    /// signs via the Sigstore public-good instance (Fulcio + Rekor)
+    /// and attaches the resulting bundle so registries that honor
+    /// npm's provenance protocol light up the "provenance" badge on
+    /// the published version.
+    #[arg(long)]
+    pub provenance: bool,
+    /// Override the target registry URL.
+    ///
+    /// Defaults to the scoped registry for the package (if
+    /// configured) or the default `.npmrc` registry.
+    #[arg(long, value_name = "URL")]
+    pub registry: Option<String>,
+    /// Default dist-tag to publish under (default: `latest`).
+    #[arg(long, value_name = "TAG")]
+    pub tag: Option<String>,
+}
+
+pub async fn run(
+    args: PublishArgs,
+    filter: aube_workspace::selector::EffectiveFilter,
+) -> miette::Result<()> {
+    let _ = args.ignore_scripts; // parity no-op: aube's publish path doesn't run lifecycle scripts yet
+    let cwd = crate::dirs::project_root()?;
+
+    if !args.no_git_checks {
+        enforce_git_checks(&cwd)?;
+    }
+
+    if !filter.is_empty() {
+        return run_recursive(&cwd, &args, &filter).await;
+    }
+
+    // Single-package mode: config_root == pkg_dir == cwd.
+    let config = super::load_npm_config(&cwd);
+    let policy = super::resolve_fetch_policy(&cwd);
+    let client = RegistryClient::from_config_with_policy(config.clone(), policy);
+    let outcome = publish_one(&cwd, &config, &client, &args, false).await?;
+    emit_outcome(&outcome, args.json)?;
+    Ok(())
+}
+
+/// pnpm-compatible git pre-flight: in a git worktree, refuse to
+/// publish when there are uncommitted tracked changes or when the
+/// current branch isn't one of the conventional release branches.
+/// Outside a git repo — or when `git` isn't on `PATH` — this is a
+/// no-op (pnpm does the same; you just can't gate something you
+/// can't observe).
+fn enforce_git_checks(cwd: &Path) -> miette::Result<()> {
+    // `git rev-parse --is-inside-work-tree` → "true" inside a repo,
+    // error otherwise. We treat any failure as "not a git repo" and
+    // skip the rest of the checks.
+    let inside = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(cwd)
+        .output();
+    let Ok(out) = inside else {
+        return Ok(());
+    };
+    if !out.status.success() || String::from_utf8_lossy(&out.stdout).trim() != "true" {
+        return Ok(());
+    }
+
+    // `git status --porcelain` on tracked files only; `--untracked-files=no`
+    // matches pnpm's logic (untracked files are fine — they just haven't
+    // been added yet and won't be published).
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| miette!("failed to run `git status`: {e}"))?;
+    if !status.status.success() {
+        return Err(miette!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        ));
+    }
+    let dirty = String::from_utf8_lossy(&status.stdout);
+    if !dirty.trim().is_empty() {
+        return Err(miette!(
+            "aube publish: working tree has uncommitted changes:\n{}\n\
+             help: commit or stash them, or pass --no-git-checks to override",
+            dirty.trim_end()
+        ));
+    }
+
+    // pnpm also refuses to publish off non-release branches (anything
+    // other than `master`, `main`, or a semver `v*` branch). We match
+    // that set exactly so `--no-git-checks` remains the only escape.
+    let branch = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| miette!("failed to run `git rev-parse`: {e}"))?;
+    if !branch.status.success() {
+        return Ok(());
+    }
+    let branch = String::from_utf8_lossy(&branch.stdout).trim().to_string();
+    // Release-branch allowlist. `v1.x` / `release/1.2` pass; unrelated
+    // prefixes like `vendor/` or `validation` do not. Match the pnpm
+    // default (`master`, `main`) plus the semver-style variants aube
+    // has historically accepted, but require the `v`/`release` prefix
+    // to actually lead into a version segment.
+    //
+    // Detached HEAD (`git rev-parse --abbrev-ref HEAD` returns the
+    // literal string `"HEAD"`) is intentionally allowed: tag-based CI
+    // checkouts run in detached HEAD state, and that's the most common
+    // automated publish flow. Users who want to refuse detached-HEAD
+    // publishes can still require a specific branch via their own
+    // git hook or CI gate — aube mirrors pnpm's default here.
+    let is_version_branch = |b: &str, prefix: &str| -> bool {
+        let Some(rest) = b.strip_prefix(prefix) else {
+            return false;
+        };
+        rest.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit() || c == '/' || c == '-' || c == '.')
+    };
+    let ok = matches!(branch.as_str(), "master" | "main" | "HEAD")
+        || is_version_branch(&branch, "v")
+        || is_version_branch(&branch, "release");
+    if !ok {
+        return Err(miette!(
+            "aube publish: current branch `{branch}` is not a release branch\n\
+             help: switch to main/master or pass --no-git-checks to override"
+        ));
+    }
+    Ok(())
+}
+
+/// Workspace fanout: discover packages, filter, and publish each one.
+/// Exits non-zero if any per-package publish fails, but keeps going so
+/// one bad package doesn't hide the state of the rest.
+async fn run_recursive(
+    source_root: &Path,
+    args: &PublishArgs,
+    filter: &aube_workspace::selector::EffectiveFilter,
+) -> miette::Result<()> {
+    let workspace_pkgs = aube_workspace::find_workspace_packages(source_root)
+        .map_err(|e| miette!("failed to discover workspace packages: {e}"))?;
+    if workspace_pkgs.is_empty() {
+        return Err(miette!(
+            "aube publish: no workspace packages found. \
+             `--recursive` / `--filter` requires a pnpm-workspace.yaml at {}",
+            source_root.display()
+        ));
+    }
+
+    let selected = select_workspace_packages(source_root, &workspace_pkgs, filter)?;
+    if selected.is_empty() {
+        if !filter.is_empty() {
+            return Err(miette!(
+                "aube publish: --filter {:?} did not match any workspace package",
+                filter
+            ));
+        }
+        return Err(miette!(
+            "aube publish: no publishable workspace packages (all private or empty)"
+        ));
+    }
+
+    // Load `.npmrc` once from the workspace root, not from each package
+    // subdir. pnpm walks both, but in practice auth tokens and scoped
+    // registry overrides live in the root `.npmrc` (or ~/.npmrc) — a
+    // per-package load would silently miss them and every package in
+    // the fanout would 401/403 on read or "no auth token" on write.
+    let config = super::load_npm_config(source_root);
+    let policy = super::resolve_fetch_policy(source_root);
+    let client = RegistryClient::from_config_with_policy(config.clone(), policy);
+
+    let mut outcomes: Vec<PublishOutcome> = Vec::new();
+    let mut failures: Vec<(String, miette::Report)> = Vec::new();
+    for pkg_dir in &selected {
+        // Each package carries its own display label for error attribution
+        // — workspace folder names are usually more stable than package
+        // names under refactors, so we lean on the path.
+        match publish_one(pkg_dir, &config, &client, args, true).await {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(e) => failures.push((pkg_dir.display().to_string(), e)),
+        }
+    }
+
+    if args.json {
+        emit_json_many(&outcomes)?;
+    } else {
+        for o in &outcomes {
+            emit_outcome_line(o);
+        }
+    }
+
+    if !failures.is_empty() {
+        let joined = failures
+            .iter()
+            .map(|(p, e)| format!("  {p}: {e}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(miette!(
+            "aube publish: {} package(s) failed:\n{joined}",
+            failures.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Narrow a discovered workspace-package list to the ones we should
+/// try to publish. Drops packages without a `name`/`version`, drops
+/// private packages, and (if `filters` is non-empty) keeps only those
+/// matching at least one selector.
+fn select_workspace_packages(
+    workspace_root: &Path,
+    workspace_pkgs: &[PathBuf],
+    filters: &aube_workspace::selector::EffectiveFilter,
+) -> miette::Result<Vec<PathBuf>> {
+    let selected = aube_workspace::selector::select_workspace_packages(
+        workspace_root,
+        workspace_pkgs,
+        filters,
+    )
+    .map_err(|e| miette!("invalid --filter selector: {e}"))?;
+    let seen_names: Vec<String> = selected.iter().filter_map(|p| p.name.clone()).collect();
+    let out: Vec<PathBuf> = selected
+        .into_iter()
+        .filter(|p| p.name.is_some() && p.version.is_some() && !p.private)
+        .map(|p| p.dir)
+        .collect();
+    if !filters.is_empty() && out.is_empty() && !seen_names.is_empty() {
+        tracing::debug!("aube publish: known workspace packages: {seen_names:?}");
+    }
+    Ok(out)
+}
+
+/// Result of a single-package publish attempt. Carries the resolved
+/// name/version unconditionally so the `AlreadyPublished` skip path
+/// can report without having built a tarball. The `archive` is only
+/// present for outcomes that actually built one (published + dry-run);
+/// skipping a package that's already on the registry deliberately
+/// avoids the expensive `build_archive` / body-hash work, which is
+/// the whole point of the pre-PUT existence check.
+struct PublishOutcome {
+    name: String,
+    version: String,
+    registry_url: String,
+    archive: Option<BuiltArchive>,
+    status: PublishStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishStatus {
+    Published,
+    DryRun,
+    AlreadyPublished,
+}
+
+/// Publish a single package rooted at `pkg_dir`. All registry work
+/// lives here so `run` and `run_recursive` share one code path. `config`
+/// is loaded once at the workspace root by the caller so every package
+/// in a fanout sees the same auth/scoped-registry view.
+async fn publish_one(
+    pkg_dir: &Path,
+    config: &NpmConfig,
+    client: &RegistryClient,
+    args: &PublishArgs,
+    fanout: bool,
+) -> miette::Result<PublishOutcome> {
+    // Read the manifest *first* so the name/version needed for the
+    // existence check are available without touching the filesystem
+    // for file collection or the CPU for gzip/SHA hashing. This is the
+    // whole reason re-running `aube publish -r` on a mostly-published
+    // workspace is cheap — the happy-path skip must not pay the cost
+    // of a packed tarball.
+    let manifest = PackageJson::from_path(&pkg_dir.join("package.json"))
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {}/package.json", pkg_dir.display()))?;
+    let name = manifest
+        .name
+        .as_deref()
+        .ok_or_else(|| miette!("publish: {}/package.json has no `name`", pkg_dir.display()))?
+        .to_string();
+    let version = manifest
+        .version
+        .as_deref()
+        .ok_or_else(|| {
+            miette!(
+                "publish: {}/package.json has no `version`",
+                pkg_dir.display()
+            )
+        })?
+        .to_string();
+
+    let registry_url = args
+        .registry
+        .as_deref()
+        .map(normalize_registry_url_pub)
+        .unwrap_or_else(|| config.registry_for(&name).to_string());
+
+    let tag = args.tag.as_deref().unwrap_or("latest").to_string();
+
+    if args.dry_run {
+        // Dry-run still builds the archive: the whole point is to show
+        // the user what *would* be uploaded, including the file list.
+        let archive = build_archive(pkg_dir)?;
+        // `--dry-run --provenance` is a common "does my CI actually have
+        // OIDC wired up?" smoke test. Silently skipping the OIDC probe
+        // here would give a false green light — so we run the ambient
+        // detection even in dry-run mode. We stop short of the Fulcio /
+        // Rekor round-trip because (a) we don't want to spam the public
+        // tlog with throwaway entries and (b) dry-run should be cheap.
+        if args.provenance {
+            crate::commands::publish_provenance::probe_oidc_available()
+                .await
+                .wrap_err("--dry-run --provenance: OIDC probe failed")?;
+        }
+        return Ok(PublishOutcome {
+            name,
+            version,
+            registry_url,
+            archive: Some(archive),
+            status: PublishStatus::DryRun,
+        });
+    }
+
+    ensure_registry_auth(client, &registry_url)?;
+
+    // Pre-flight: ask the registry whether `name@version` is already
+    // there. In fanout mode a hit is a silent skip (so `-r publish` is
+    // idempotent on partial success) and in single-package mode it is
+    // a hard error with a clear message — pnpm's behavior. `--force`
+    // opts out of both: it turns the skip into a PUT and suppresses
+    // the single-package error, leaving the registry to decide whether
+    // a republish is allowed (npm refuses, Verdaccio usually accepts).
+    if !args.force && version_on_registry(client, &registry_url, &name, &version).await {
+        if fanout {
+            return Ok(PublishOutcome {
+                name,
+                version,
+                registry_url,
+                archive: None,
+                status: PublishStatus::AlreadyPublished,
+            });
+        }
+        return Err(miette!(
+            "aube publish: {name}@{version} is already on {registry_url}\n\
+             help: pass --force to republish (the registry must allow it; npm's public registry does not)"
+        ));
+    }
+
+    // Build the tarball + publish body only now that we know we're
+    // actually going to PUT. For a re-run of `-r publish` where every
+    // package is already on the registry, the loop never reaches this
+    // point and the whole fanout is gzip-free.
+    let archive = build_archive(pkg_dir)?;
+
+    // Sigstore signing is the one step here that can take seconds
+    // (Fulcio + Rekor + optional TSA round-trips), so we do it *before*
+    // serializing the publish body rather than after — a signing
+    // failure should never leave us with a half-built request.
+    let provenance_bundle = if args.provenance {
+        Some(
+            crate::commands::publish_provenance::generate(
+                &archive.tarball,
+                &archive.name,
+                &archive.version,
+            )
+            .await
+            .wrap_err("failed to generate SLSA provenance attestation")?,
+        )
+    } else {
+        None
+    };
+
+    let body = build_publish_body(
+        &archive,
+        &manifest,
+        &registry_url,
+        &tag,
+        args.access.as_deref(),
+        provenance_bundle.as_deref(),
+    )?;
+
+    let url = put_url(&registry_url, &archive.name);
+    let mut req = client
+        .authed_request(reqwest::Method::PUT, &url, &registry_url)
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(&body).into_diagnostic()?);
+    if let Some(otp) = &args.otp {
+        req = req.header("npm-otp", otp);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to PUT {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(miette!("publish failed: {status}: {}", body.trim()));
+    }
+
+    Ok(PublishOutcome {
+        name,
+        version,
+        registry_url,
+        archive: Some(archive),
+        status: PublishStatus::Published,
+    })
+}
+
+/// GET `{registry}/{name}` and check whether `versions[version]` is
+/// present. Any transport/parse failure returns `false` so we fall
+/// through to the PUT and let the registry itself reject duplicates —
+/// being *wrong* about "already published" is worse than a harmless
+/// extra PUT attempt. The GET is sent through the same registry client
+/// we'd use for the PUT so private registries (Verdaccio auth, GitHub
+/// Packages, Artifactory) can actually answer it.
+async fn version_on_registry(
+    client: &RegistryClient,
+    registry_url: &str,
+    name: &str,
+    version: &str,
+) -> bool {
+    let url = put_url(registry_url, name);
+    let Ok(resp) = client
+        .authed_request(reqwest::Method::GET, &url, registry_url)
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    let Ok(doc) = resp.json::<serde_json::Value>().await else {
+        return false;
+    };
+    doc.get("versions").and_then(|v| v.get(version)).is_some()
+}
+
+fn emit_outcome(outcome: &PublishOutcome, as_json: bool) -> miette::Result<()> {
+    if as_json {
+        emit_json_many(std::slice::from_ref(outcome))
+    } else {
+        emit_outcome_line(outcome);
+        Ok(())
+    }
+}
+
+fn emit_outcome_line(outcome: &PublishOutcome) {
+    match outcome.status {
+        PublishStatus::DryRun => {
+            println!(
+                "+ {}@{} (dry run, would PUT to {})",
+                outcome.name,
+                outcome.version,
+                put_url(&outcome.registry_url, &outcome.name)
+            );
+            if let Some(archive) = &outcome.archive {
+                for f in &archive.files {
+                    println!("  {f}");
+                }
+            }
+        }
+        PublishStatus::Published => {
+            println!("+ {}@{}", outcome.name, outcome.version);
+        }
+        PublishStatus::AlreadyPublished => {
+            println!(
+                "= {}@{} (already on registry, skipping)",
+                outcome.name, outcome.version
+            );
+        }
+    }
+}
+
+fn emit_json_many(outcomes: &[PublishOutcome]) -> miette::Result<()> {
+    // The base `{name, version, filename, files}` shape matches
+    // `aube pack --json` for compatibility with existing pnpm-style
+    // consumers. We extend it with a `status` field so CI tooling
+    // driving recursive publish can tell which packages actually went
+    // out this run vs which were no-ops — the plain-text path
+    // distinguishes them with `+` / `=` / dry-run markers, and losing
+    // that distinction in JSON mode defeats the idempotency promise.
+    let arr: Vec<serde_json::Value> = outcomes
+        .iter()
+        .map(|o| {
+            let status = match o.status {
+                PublishStatus::Published => "published",
+                PublishStatus::AlreadyPublished => "skipped",
+                PublishStatus::DryRun => "dry-run",
+            };
+            // `filename` / `files` are only present when we actually
+            // built a tarball. Skipped (already-published) entries
+            // leave them off — consumers should branch on `status`.
+            let mut obj = serde_json::json!({
+                "name": o.name,
+                "version": o.version,
+                "status": status,
+            });
+            if let Some(archive) = &o.archive {
+                let m = obj.as_object_mut().unwrap();
+                m.insert("filename".into(), archive.filename.clone().into());
+                m.insert(
+                    "files".into(),
+                    serde_json::Value::Array(
+                        archive
+                            .files
+                            .iter()
+                            .map(|p| serde_json::json!({"path": p}))
+                            .collect(),
+                    ),
+                );
+            }
+            obj
+        })
+        .collect();
+    let out = serde_json::to_string_pretty(&arr).into_diagnostic()?;
+    println!("{out}");
+    Ok(())
+}
+
+/// `{registry}/{name}`. Uses the shared `encode_package_name` helper
+/// from `commands/mod.rs` so `publish` and `unpublish` can't drift on
+/// URL shape.
+fn put_url(registry: &str, name: &str) -> String {
+    let base = registry.trim_end_matches('/');
+    format!("{base}/{}", encode_package_name(name))
+}
+
+/// Assemble the JSON body npm/pnpm send for `PUT /<name>`. The tarball
+/// URL we hand the registry is where *we think* the file will live; real
+/// registries rewrite it on ingest, so its exact form only needs to be
+/// parseable — we use `{registry}/{name}/-/{filename}` to match pnpm.
+fn build_publish_body(
+    archive: &BuiltArchive,
+    manifest: &PackageJson,
+    registry_url: &str,
+    tag: &str,
+    access: Option<&str>,
+    provenance_bundle_json: Option<&str>,
+) -> miette::Result<serde_json::Value> {
+    let shasum = hex::encode(sha1::Sha1::digest(&archive.tarball));
+    let integrity = {
+        let digest = Sha512::digest(&archive.tarball);
+        format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        )
+    };
+    let b64_tarball = base64::engine::general_purpose::STANDARD.encode(&archive.tarball);
+
+    let tarball_url = format!(
+        "{}/{}/-/{}",
+        registry_url.trim_end_matches('/'),
+        archive.name,
+        archive.filename
+    );
+
+    // Start from the manifest JSON so every field the user set (scripts,
+    // keywords, repository, ...) reaches the registry, then bolt on the
+    // `_id` and `dist` block that the publish protocol requires.
+    let mut version_doc = serde_json::to_value(manifest).into_diagnostic()?;
+    let obj = version_doc
+        .as_object_mut()
+        .ok_or_else(|| miette!("manifest did not serialize to a JSON object"))?;
+    obj.insert(
+        "_id".into(),
+        format!("{}@{}", archive.name, archive.version).into(),
+    );
+    obj.insert(
+        "dist".into(),
+        serde_json::json!({
+            "shasum": shasum,
+            "integrity": integrity,
+            "tarball": tarball_url,
+        }),
+    );
+
+    let mut body = serde_json::json!({
+        "_id": archive.name,
+        "name": archive.name,
+        "dist-tags": { tag: archive.version },
+        "versions": { archive.version.clone(): version_doc },
+        "_attachments": {
+            archive.filename.clone(): {
+                "content_type": "application/octet-stream",
+                "data": b64_tarball,
+                "length": archive.tarball.len(),
+            }
+        }
+    });
+    if let Some(access) = access {
+        body.as_object_mut()
+            .unwrap()
+            .insert("access".into(), access.into());
+    }
+
+    // Provenance: npm's publish protocol expects the sigstore bundle to
+    // ride along as an extra `_attachments` entry keyed by
+    // `<name>-<version>.sigstore` with the DSSE bundle v0.3 media type.
+    // The registry re-exposes it through the `/-/npm/v1/attestations/<pkg>`
+    // endpoint, which is what lights up the "provenance" badge on npmjs.
+    //
+    // Unlike the tarball attachment, `data` here is the *raw* JSON
+    // string, not base64 — that's what `libnpmpublish` sends and what
+    // the registry parses. Sending base64 instead would leave `data`
+    // and `length` out of sync (length is the raw byte count) and the
+    // registry would fail to decode the bundle.
+    if let Some(bundle_json) = provenance_bundle_json {
+        let attachment_name = format!("{}-{}.sigstore", archive.name, archive.version);
+        let length = bundle_json.len();
+        body.as_object_mut()
+            .unwrap()
+            .get_mut("_attachments")
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| miette!("publish body missing _attachments object"))?
+            .insert(
+                attachment_name,
+                serde_json::json!({
+                    "content_type": "application/vnd.dev.sigstore.bundle+json;version=0.3",
+                    "data": bundle_json,
+                    "length": length,
+                }),
+            );
+    }
+
+    Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aube_registry::config::registry_uri_key_pub;
+
+    #[test]
+    fn put_url_encodes_scoped_slash() {
+        assert_eq!(
+            put_url("https://registry.npmjs.org/", "@scope/pkg"),
+            "https://registry.npmjs.org/@scope%2Fpkg"
+        );
+    }
+
+    #[test]
+    fn put_url_plain_name() {
+        assert_eq!(
+            put_url("https://registry.npmjs.org", "lodash"),
+            "https://registry.npmjs.org/lodash"
+        );
+    }
+
+    fn write_manifest(dir: &Path, body: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join("package.json");
+        std::fs::write(&p, body).unwrap();
+        dir.to_path_buf()
+    }
+
+    #[test]
+    fn select_skips_private_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = write_manifest(&tmp.path().join("a"), r#"{"name":"a","version":"1.0.0"}"#);
+        let b = write_manifest(
+            &tmp.path().join("b"),
+            r#"{"name":"b","version":"1.0.0","private":true}"#,
+        );
+        let out = select_workspace_packages(
+            tmp.path(),
+            &[a.clone(), b],
+            &aube_workspace::selector::EffectiveFilter::default(),
+        )
+        .unwrap();
+        assert_eq!(out, vec![a]);
+    }
+
+    #[test]
+    fn select_respects_filter_exact_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = write_manifest(
+            &tmp.path().join("a"),
+            r#"{"name":"@scope/a","version":"1.0.0"}"#,
+        );
+        let b = write_manifest(&tmp.path().join("b"), r#"{"name":"b","version":"1.0.0"}"#);
+        let out = select_workspace_packages(
+            tmp.path(),
+            &[a, b.clone()],
+            &aube_workspace::selector::EffectiveFilter::from_filters(["b"]),
+        )
+        .unwrap();
+        assert_eq!(out, vec![b]);
+    }
+
+    #[test]
+    fn select_respects_filter_glob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = write_manifest(
+            &tmp.path().join("a"),
+            r#"{"name":"@scope/a","version":"1.0.0"}"#,
+        );
+        let b = write_manifest(
+            &tmp.path().join("b"),
+            r#"{"name":"@scope/b","version":"1.0.0"}"#,
+        );
+        let c = write_manifest(
+            &tmp.path().join("c"),
+            r#"{"name":"other","version":"1.0.0"}"#,
+        );
+        let out = select_workspace_packages(
+            tmp.path(),
+            &[a.clone(), b.clone(), c],
+            &aube_workspace::selector::EffectiveFilter::from_filters(["@scope/*"]),
+        )
+        .unwrap();
+        assert_eq!(out, vec![a, b]);
+    }
+
+    #[test]
+    fn select_skips_manifest_without_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = write_manifest(&tmp.path().join("a"), r#"{"name":"a"}"#);
+        assert!(
+            select_workspace_packages(
+                tmp.path(),
+                &[a],
+                &aube_workspace::selector::EffectiveFilter::default(),
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn uri_key_matches_registry_helper() {
+        // sanity: registry_uri_key_pub must produce the same shape
+        // login/logout use, so tokens written by login are findable here.
+        assert_eq!(
+            registry_uri_key_pub("https://registry.npmjs.org/"),
+            "//registry.npmjs.org/"
+        );
+    }
+}

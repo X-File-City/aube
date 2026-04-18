@@ -1,0 +1,1010 @@
+pub mod add;
+pub mod approve_builds;
+pub mod audit;
+pub mod bin;
+pub mod cache;
+pub mod cat_file;
+pub mod cat_index;
+pub mod catalogs;
+pub mod ci;
+pub mod clean;
+pub mod completion;
+pub mod config;
+pub mod create;
+pub mod dedupe;
+pub mod deploy;
+pub mod deprecate;
+pub mod dist_tag;
+pub mod dlx;
+pub mod exec;
+pub mod fetch;
+pub mod find_hash;
+pub mod global;
+pub mod ignored_builds;
+pub mod import;
+pub mod init;
+pub mod inject;
+pub mod install;
+pub mod install_test;
+pub mod licenses;
+pub mod link;
+pub mod list;
+pub mod login;
+pub mod logout;
+pub mod npm_fallback;
+pub mod npmrc;
+pub mod outdated;
+pub mod pack;
+pub mod patch;
+pub mod patch_commit;
+pub mod patch_remove;
+pub mod peers;
+pub mod prune;
+pub mod publish;
+pub mod publish_provenance;
+pub mod rebuild;
+pub mod recursive;
+pub mod remove;
+pub mod restart;
+pub mod root;
+pub mod run;
+pub mod sbom;
+pub mod store;
+pub mod undeprecate;
+pub mod unlink;
+pub mod unpublish;
+pub mod update;
+pub mod version;
+pub mod view;
+pub mod why;
+
+use aube_registry::client::RegistryClient;
+use aube_registry::config::NpmConfig;
+use miette::{Context, IntoDiagnostic, miette};
+use std::any::Any;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{OnceLock, RwLock};
+
+/// Process-wide snapshot of the top-level `--frozen-lockfile` /
+/// `--no-frozen-lockfile` / `--prefer-frozen-lockfile` flags. Set once
+/// by `async_main` before any command runs so downstream helpers
+/// (`ensure_installed`, chained `install::run` calls from
+/// `add`/`remove`/`update`/…) can pick them up without plumbing a
+/// context struct through every command signature.
+static GLOBAL_FROZEN: OnceLock<install::GlobalFrozenFlags> = OnceLock::new();
+
+/// Process-wide registry override from the top-level `--registry=<url>`
+/// flag. Applied in `make_client` (and any direct `NpmConfig::load`
+/// caller that funnels through `load_npm_config`) so a single flag
+/// covers every registry touch point in one invocation.
+static REGISTRY_OVERRIDE: RwLock<Option<String>> = RwLock::new(None);
+
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct GlobalOutputFlags {
+    pub silent: bool,
+}
+
+static GLOBAL_OUTPUT: OnceLock<GlobalOutputFlags> = OnceLock::new();
+
+pub(crate) fn set_registry_override(url: Option<String>) {
+    *REGISTRY_OVERRIDE.write().expect("registry lock poisoned") =
+        url.map(|u| aube_registry::config::normalize_registry_url_pub(&u));
+}
+
+pub(crate) struct RegistryOverrideGuard {
+    previous: Option<String>,
+    changed: bool,
+}
+
+impl Drop for RegistryOverrideGuard {
+    fn drop(&mut self) {
+        if self.changed {
+            *REGISTRY_OVERRIDE.write().expect("registry lock poisoned") = self.previous.take();
+        }
+    }
+}
+
+pub(crate) fn scoped_registry_override(url: Option<String>) -> RegistryOverrideGuard {
+    let mut guard = REGISTRY_OVERRIDE.write().expect("registry lock poisoned");
+    let previous = guard.clone();
+    let changed = url.is_some();
+    if let Some(u) = url {
+        *guard = Some(aube_registry::config::normalize_registry_url_pub(&u));
+    }
+    RegistryOverrideGuard { previous, changed }
+}
+
+pub(crate) fn registry_override() -> Option<String> {
+    REGISTRY_OVERRIDE
+        .read()
+        .expect("registry lock poisoned")
+        .clone()
+}
+
+/// Load an `NpmConfig` for `dir` and then apply the process-wide
+/// `--registry` override, if any. Use this from any command that
+/// needs config but wants the CLI flag to win.
+pub(crate) fn load_npm_config(dir: &std::path::Path) -> NpmConfig {
+    let mut config = NpmConfig::load(dir);
+    if let Some(url) = registry_override() {
+        config.registry = url;
+    }
+    config
+}
+
+/// Record the global frozen-lockfile flag snapshot. Called once per
+/// process from `async_main`.
+pub(crate) fn set_global_frozen_flags(flags: install::GlobalFrozenFlags) {
+    let _ = GLOBAL_FROZEN.set(flags);
+}
+
+pub(crate) fn set_global_output_flags(flags: GlobalOutputFlags) {
+    let _ = GLOBAL_OUTPUT.set(flags);
+}
+
+/// Read the recorded global frozen-lockfile flag snapshot, or the
+/// default (all `false`) if none was set — e.g. in unit tests that
+/// bypass `async_main`.
+pub(crate) fn global_frozen_flags() -> install::GlobalFrozenFlags {
+    GLOBAL_FROZEN.get().copied().unwrap_or_default()
+}
+
+pub(crate) fn global_output_flags() -> GlobalOutputFlags {
+    GLOBAL_OUTPUT.get().copied().unwrap_or_default()
+}
+
+pub(crate) fn configure_script_settings(ctx: &aube_settings::ResolveCtx<'_>) {
+    let node_options = aube_settings::resolved::node_options(ctx).and_then(non_empty_string);
+    let script_shell = aube_settings::resolved::script_shell(ctx)
+        .and_then(|s| non_empty_string(s).map(Into::into));
+    let unsafe_perm = aube_settings::resolved::unsafe_perm(ctx);
+    let shell_emulator = aube_settings::resolved::shell_emulator(ctx);
+    aube_scripts::set_script_settings(aube_scripts::ScriptSettings {
+        node_options,
+        script_shell,
+        unsafe_perm,
+        shell_emulator,
+    });
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+pub(crate) fn retarget_cwd(path: &Path) -> miette::Result<()> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().into_diagnostic()?.join(path)
+    };
+    std::env::set_current_dir(&path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to chdir into {}", path.display()))?;
+    crate::dirs::set_cwd(&path)?;
+    Ok(())
+}
+
+/// Compute the `FrozenMode` a chained install (`add`, `remove`,
+/// `update`, `ensure_installed`, …) should use, taking into account
+/// the process-wide global `--frozen-lockfile` flags and falling back
+/// to the given default when none was set on the command line.
+pub(crate) fn chained_frozen_mode(default: install::FrozenMode) -> install::FrozenMode {
+    let g = global_frozen_flags();
+    if g.frozen || g.no_frozen || g.prefer_frozen {
+        install::FrozenMode::from_flags(g.frozen, g.no_frozen, g.prefer_frozen, None)
+    } else {
+        default
+    }
+}
+
+pub(crate) fn ensure_registry_auth(
+    client: &RegistryClient,
+    registry_url: &str,
+) -> miette::Result<()> {
+    if client.has_resolved_auth_for(registry_url) {
+        Ok(())
+    } else {
+        Err(miette!(
+            "no auth token for {registry_url}. Run `aube login --registry {registry_url}` first."
+        ))
+    }
+}
+
+/// Process-wide guard: `true` while a project lock is held by this process.
+/// Nested commands (e.g. `add` calling `install`) observe this and skip
+/// re-acquiring so they don't deadlock against themselves.
+static LOCK_HELD: AtomicBool = AtomicBool::new(false);
+
+/// Whether the project-level advisory lock is disabled. Resolves the
+/// `aubeNoLock` setting through the full cli > env > npmrc >
+/// workspace.yaml chain so `.npmrc` and `aube-workspace.yaml` entries
+/// participate alongside the canonical `AUBE_NO_LOCK` env var.
+fn aube_no_lock_enabled(cwd: &std::path::Path) -> bool {
+    with_settings_ctx(cwd, aube_settings::resolved::aube_no_lock)
+}
+
+/// Opaque guard holding a project-level advisory lock. Dropping it releases
+/// the lock and clears the process-wide `LOCK_HELD` flag. Commands bind
+/// this to a `_lock` variable at the top of `run` so the lock is held for
+/// the duration of the command.
+///
+/// The `_inner` field holds an erased `fslock::LockFile` (via `dyn Any`)
+/// so callers don't have to take a direct dep on `fslock` to name the
+/// type — the lock is released on drop regardless.
+pub(crate) struct ProjectLock {
+    _inner: Option<Box<dyn Any + Send>>,
+    owns_flag: bool,
+}
+
+impl Drop for ProjectLock {
+    fn drop(&mut self) {
+        if self.owns_flag {
+            LOCK_HELD.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Take an advisory lock on the current project's `node_modules/`.
+///
+/// The lock is keyed off the canonical path of `node_modules` (hashed into
+/// `$TMPDIR/fslock/`), so multiple `aube` invocations against the same
+/// project — even via different relative paths or symlinks — serialize
+/// correctly.
+///
+/// Returns a no-op guard when `AUBE_NO_LOCK` is active or when this
+/// process already holds the project lock (re-entrant case for
+/// `add` → `install`), so callers don't need to special-case.
+pub(crate) fn take_project_lock(cwd: &std::path::Path) -> miette::Result<ProjectLock> {
+    if aube_no_lock_enabled(cwd) {
+        return Ok(ProjectLock {
+            _inner: None,
+            owns_flag: false,
+        });
+    }
+
+    // Re-entrant: if this process already holds the lock (outer command
+    // chained into an inner one like add → install), skip re-acquisition.
+    if LOCK_HELD.load(Ordering::Acquire) {
+        return Ok(ProjectLock {
+            _inner: None,
+            owns_flag: false,
+        });
+    }
+
+    let nm_path = project_modules_dir(cwd);
+    let lock = xx::fslock::FSLock::new(&nm_path)
+        .with_callback(|_| {
+            eprintln!("Waiting for another aube process to finish in this project...");
+        })
+        .lock()
+        .map_err(|e| miette!("failed to acquire project lock: {e}"))?;
+
+    // Only mark the flag as held AFTER the OS lock is in hand, so a nested
+    // call can't observe `LOCK_HELD = true` and get a no-op guard before
+    // this process actually owns the underlying advisory lock.
+    LOCK_HELD.store(true, Ordering::Release);
+
+    Ok(ProjectLock {
+        _inner: Some(Box::new(lock)),
+        owns_flag: true,
+    })
+}
+
+/// Open the global content-addressable store, honoring a `storeDir`
+/// override from `.npmrc` or `pnpm-workspace.yaml` in `cwd`. Falls
+/// back to the aube-owned default at `~/.aube-store/v1/files/`.
+///
+/// Path interpretation matches pnpm: a leading `~` expands to the
+/// user's home directory; relative paths are resolved against `cwd`
+/// (so each project sees a consistent store regardless of where the
+/// command was invoked from). The CAS schema suffix `v1/files` is
+/// appended to the user-supplied path so the on-disk layout is stable
+/// across versions of aube and never collides with a pnpm store rooted
+/// at the same path.
+pub(crate) fn open_store(cwd: &std::path::Path) -> miette::Result<aube_store::Store> {
+    if let Some(custom) = resolved_store_dir(cwd) {
+        aube_store::Store::with_root(custom.join("v1").join("files"))
+            .into_diagnostic()
+            .wrap_err("failed to open store")
+    } else {
+        aube_store::Store::default_location()
+            .into_diagnostic()
+            .wrap_err("failed to open store")
+    }
+}
+
+/// Resolve the configured `storeDir` for `cwd`, returning `None` if
+/// no override is set or the value can't be parsed. Walks `.npmrc`
+/// and `pnpm-workspace.yaml` via `aube_settings::resolved::store_dir`,
+/// then expands `~` and makes relative paths absolute against `cwd`.
+/// The returned path is the user-facing store root *without* the
+/// `v3/files` schema suffix — callers append it where needed (see
+/// [`open_store`]).
+fn resolved_store_dir(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    with_settings_ctx(cwd, |ctx| {
+        let raw = aube_settings::resolved::store_dir(ctx)?;
+        expand_setting_path(&raw, cwd)
+    })
+}
+
+/// Expand a path-typed setting value: `~` → `$HOME`, relative → absolute
+/// against `cwd`. Returns `None` when the value starts with `~` but
+/// `HOME` is not set, so callers can fall back to a safe default
+/// instead of producing a nonsensical path like `/project/~/foo`.
+pub(crate) fn expand_setting_path(raw: &str, cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    let expanded = if let Some(rest) = raw.strip_prefix("~/") {
+        std::path::PathBuf::from(std::env::var_os("HOME")?).join(rest)
+    } else if raw == "~" {
+        std::path::PathBuf::from(std::env::var_os("HOME")?)
+    } else {
+        std::path::PathBuf::from(raw)
+    };
+    Some(if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
+    })
+}
+
+/// Build a file-only `ResolveCtx` for `cwd` and call `f` with it.
+/// Handles the temporary ownership of npmrc/workspace/env data so
+/// callers don't need to import `serde_yaml`.
+pub(crate) fn with_settings_ctx<T>(
+    cwd: &std::path::Path,
+    f: impl FnOnce(&aube_settings::ResolveCtx<'_>) -> T,
+) -> T {
+    let npmrc = aube_registry::config::load_npmrc_entries(cwd);
+    let raw_workspace = aube_manifest::workspace::load_raw(cwd).unwrap_or_default();
+    let env = aube_settings::values::capture_env();
+    let ctx = aube_settings::ResolveCtx {
+        npmrc: &npmrc,
+        workspace_yaml: &raw_workspace,
+        env: &env,
+        cli: &[],
+    };
+    f(&ctx)
+}
+
+/// Build a registry client configured from .npmrc files in the project directory.
+///
+/// Also resolves the `fetch*` settings (timeout + retries + backoff)
+/// from the full cli > env > npmrc > workspace precedence chain and
+/// threads the resulting [`aube_registry::config::FetchPolicy`] into
+/// the client. `.npmrc` is the canonical source for these today, but
+/// going through the settings resolver means env-var overrides like
+/// `NPM_CONFIG_FETCH_TIMEOUT` and future CLI flags Just Work without
+/// touching this function again.
+pub(crate) fn make_client(cwd: &std::path::Path) -> aube_registry::client::RegistryClient {
+    let config = load_npm_config(cwd);
+    tracing::debug!("registry: {}", config.registry);
+    for (scope, url) in &config.scoped_registries {
+        tracing::debug!("scoped registry: {scope} -> {url}");
+    }
+    let policy = resolve_fetch_policy(cwd);
+    aube_registry::client::RegistryClient::from_config_with_policy(config, policy)
+}
+
+/// Resolve [`aube_registry::config::FetchPolicy`] from the same
+/// sources the rest of the CLI consumes settings from. Kept separate
+/// from [`make_client`] so tests and ad-hoc callers (publish,
+/// deprecate, etc) can opt in without duplicating the ctx-building
+/// boilerplate.
+pub(crate) fn resolve_fetch_policy(cwd: &std::path::Path) -> aube_registry::config::FetchPolicy {
+    let npmrc = aube_registry::config::load_npmrc_entries(cwd);
+    let workspace_yaml = aube_manifest::workspace::load_both(cwd)
+        .map(|(_, raw)| raw)
+        .unwrap_or_default();
+    let env = aube_settings::values::capture_env();
+    let ctx = aube_settings::ResolveCtx {
+        npmrc: &npmrc,
+        workspace_yaml: &workspace_yaml,
+        env: &env,
+        cli: &[],
+    };
+    aube_registry::config::FetchPolicy::from_ctx(&ctx)
+}
+
+/// Resolve the `cacheDir` setting for `cwd`. If an explicit override
+/// is set in `.npmrc`, expands it and returns that path. Otherwise
+/// falls back to the XDG-aware platform default (`~/.cache/aube`).
+///
+/// Note: `XDG_CACHE_HOME` is intentionally *not* a source for this
+/// setting — it's a base directory, and `aube_store::dirs::cache_dir()`
+/// already appends `/aube`. Routing it through the settings accessor
+/// would lose the subdirectory.
+pub(crate) fn resolved_cache_dir(cwd: &std::path::Path) -> std::path::PathBuf {
+    let platform_default =
+        || aube_store::dirs::cache_dir().unwrap_or_else(|| std::env::temp_dir().join("aube"));
+    // Check whether .npmrc explicitly sets cacheDir, rather than comparing
+    // the resolved value against the default string — a user who writes
+    // `cacheDir=~/.cache/aube` explicitly should get that literal path,
+    // not the XDG_CACHE_HOME-aware platform default.
+    let npmrc = aube_registry::config::load_npmrc_entries(cwd);
+    let has_explicit = npmrc
+        .iter()
+        .any(|(k, _)| k == "cacheDir" || k == "cache-dir");
+    if !has_explicit {
+        return platform_default();
+    }
+    with_settings_ctx(cwd, |ctx| {
+        let raw = aube_settings::resolved::cache_dir(ctx);
+        expand_setting_path(&raw, cwd).unwrap_or_else(platform_default)
+    })
+}
+
+/// Resolve the `virtualStoreDirMaxLength` setting, falling back to the
+/// platform default (`DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH`, which is
+/// 120 on Linux/macOS and will become 60 on Windows once Windows
+/// support lands). Every call site that encodes `dep_path`s into
+/// `.aube/<name>` filenames — install, list, why, patch, rebuild,
+/// engines check — must resolve the same cap, otherwise the long-path
+/// truncate-and-hash branch of `dep_path_to_filename` produces
+/// different filenames for read-side and write-side callers and
+/// silently misses packages.
+pub(crate) fn resolve_virtual_store_dir_max_length(ctx: &aube_settings::ResolveCtx<'_>) -> usize {
+    aube_settings::resolved::virtual_store_dir_max_length(ctx)
+        .map(|v| v as usize)
+        .unwrap_or(aube_lockfile::dep_path_filename::DEFAULT_VIRTUAL_STORE_DIR_MAX_LENGTH)
+}
+
+/// Load `.npmrc` + `pnpm-workspace.yaml` for `cwd` and resolve the
+/// effective `virtualStoreDirMaxLength` in one call. Convenience for
+/// post-install commands (list, why, patch) that don't build a
+/// `ResolveCtx` for any other reason.
+pub(crate) fn resolve_virtual_store_dir_max_length_for_cwd(cwd: &std::path::Path) -> usize {
+    with_settings_ctx(cwd, resolve_virtual_store_dir_max_length)
+}
+
+/// Project-level `node_modules` directory name (pnpm's `modulesDir`
+/// setting). Defaults to `"node_modules"` — users who change it are
+/// responsible for setting `NODE_PATH` themselves since Node's own
+/// resolver still looks for a literal `node_modules/`.
+///
+/// Every command that touches the top-level project directory (bin,
+/// root, prune, clean, link, unlink, run, exec, etc.) reads this so
+/// it lands on the same path the install wrote to. Commands that
+/// already build a `ResolveCtx` for other settings should call
+/// `aube_settings::resolved::modules_dir(&ctx)` directly instead of
+/// this shortcut.
+pub(crate) fn resolve_modules_dir_name_for_cwd(cwd: &std::path::Path) -> String {
+    with_settings_ctx(cwd, aube_settings::resolved::modules_dir)
+}
+
+/// Convenience: `<cwd>/<modulesDir>` as a `PathBuf`. Matches the
+/// `project_dir.join("node_modules")` pattern that every command used
+/// before `modulesDir` was wired; prefer this over the raw literal
+/// so a workspace-level override flows through automatically.
+pub(crate) fn project_modules_dir(cwd: &std::path::Path) -> std::path::PathBuf {
+    cwd.join(resolve_modules_dir_name_for_cwd(cwd))
+}
+
+/// Resolve the absolute path of the per-project virtual store
+/// (pnpm's `virtualStoreDir`). When the user explicitly sets the value
+/// in `.npmrc`, `pnpm-workspace.yaml`, or the environment, expand it
+/// (relative paths resolve against `project_dir`, `~` expands to
+/// `$HOME`) and return it. Otherwise derive from `modulesDir`:
+/// `<project_dir>/<modulesDir>/.aube`. This matches pnpm, where the
+/// documented default is `<modulesDir>/.pnpm` — a user who overrides
+/// `modulesDir` alone keeps a coherent layout without having to set
+/// both.
+///
+/// Every site that touches `.aube/<dep_path>/` — linker, install state
+/// sidecar, `patch`, `rebuild`, `list --long`, `why`, `prune`, `clean`,
+/// etc. — must resolve through this helper so a workspace-level
+/// override lands at the same path the install wrote to.
+pub(crate) fn resolve_virtual_store_dir(
+    ctx: &aube_settings::ResolveCtx<'_>,
+    project_dir: &std::path::Path,
+) -> std::path::PathBuf {
+    let default_from_modules_dir = || {
+        let modules_dir = aube_settings::resolved::modules_dir(ctx);
+        project_dir.join(modules_dir).join(".aube")
+    };
+    let has_explicit_npmrc = ctx
+        .npmrc
+        .iter()
+        .any(|(k, _)| k == "virtualStoreDir" || k == "virtual-store-dir");
+    let has_explicit_yaml = ctx.workspace_yaml.contains_key("virtualStoreDir");
+    let has_explicit_env = ctx
+        .env
+        .iter()
+        .any(|(k, _)| k == "npm_config_virtual_store_dir" || k == "NPM_CONFIG_VIRTUAL_STORE_DIR");
+    if !(has_explicit_npmrc || has_explicit_yaml || has_explicit_env) {
+        return default_from_modules_dir();
+    }
+    let raw = aube_settings::resolved::virtual_store_dir(ctx);
+    expand_setting_path(&raw, project_dir).unwrap_or_else(default_from_modules_dir)
+}
+
+/// Load `.npmrc` + `pnpm-workspace.yaml` for `cwd` and resolve the
+/// effective virtual-store path in one call. Convenience for
+/// post-install commands (`patch`, `list --long`, `why`, `clean`,
+/// `unlink`) that don't build a `ResolveCtx` for any other reason.
+pub(crate) fn resolve_virtual_store_dir_for_cwd(cwd: &std::path::Path) -> std::path::PathBuf {
+    with_settings_ctx(cwd, |ctx| resolve_virtual_store_dir(ctx, cwd))
+}
+
+/// Format the resolved `virtualStoreDir` as a display-ready prefix for
+/// `aube list --long` and `aube why --long`, ending with a path
+/// separator so callers can concatenate an encoded `dep_path`
+/// filename. When `aube_dir` is a subdirectory of `ref_dir` the result
+/// is relative (`./node_modules/.aube/`), matching the historical
+/// output. For overrides that sit above or outside `ref_dir` (custom
+/// `virtualStoreDir` like `~/.my-store/project` or `.vstore-out`) the
+/// absolute path is returned so users can still find where packages
+/// actually live — `../../../...` would be technically correct but
+/// hard to paste into a shell.
+pub(crate) fn format_virtual_store_display_prefix(
+    aube_dir: &std::path::Path,
+    ref_dir: &std::path::Path,
+) -> String {
+    if let Some(rel) = pathdiff::diff_paths(aube_dir, ref_dir)
+        && !rel.as_os_str().is_empty()
+        && !rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return format!("./{}/", rel.display());
+    }
+    format!("{}/", aube_dir.display())
+}
+
+/// Disk cache directory for packument metadata. Falls back to a tmp dir if
+/// the user cache dir can't be resolved (rare).
+pub(crate) fn packument_cache_dir() -> std::path::PathBuf {
+    let cwd = crate::dirs::cwd().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+    resolved_cache_dir(&cwd).join("packuments-v1")
+}
+
+/// Disk cache directory for *full* (non-corgi) packument JSON used by
+/// human-facing commands like `aube view`. Separate from the corgi cache
+/// because the shapes differ.
+pub(crate) fn packument_full_cache_dir() -> std::path::PathBuf {
+    let cwd = crate::dirs::cwd().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+    resolved_cache_dir(&cwd).join("packuments-full-v1")
+}
+
+/// Reshape an already-loaded `WorkspaceConfig` into the catalog map the
+/// resolver consumes — outer key is the catalog name, with the unnamed
+/// `catalog:` field landing under `default`. Empty when the workspace
+/// declares neither.
+///
+/// Every command that builds a `Resolver` needs to thread this map
+/// through `Resolver::with_catalogs`, otherwise the resolver hard-fails
+/// on any existing `catalog:` dep with `UnknownCatalogRef`.
+pub(crate) fn workspace_catalog_map(
+    ws_config: &aube_manifest::WorkspaceConfig,
+) -> std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> {
+    let mut out: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
+        std::collections::BTreeMap::new();
+    if !ws_config.catalog.is_empty() {
+        out.insert("default".to_string(), ws_config.catalog.clone());
+    }
+    for (name, entries) in &ws_config.catalogs {
+        out.insert(name.clone(), entries.clone());
+    }
+    out
+}
+
+/// Load `pnpm-workspace.yaml` (or `aube-workspace.yaml`) and extract its
+/// catalog map. Convenience wrapper for commands that don't already have
+/// a parsed `WorkspaceConfig` on hand. Commands that *do* (e.g.
+/// `install`) should call [`workspace_catalog_map`] directly to avoid
+/// re-reading the file.
+pub(crate) fn load_workspace_catalogs(
+    cwd: &std::path::Path,
+) -> miette::Result<std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>>
+{
+    use miette::{Context, IntoDiagnostic};
+    let (ws_config, _raw) = aube_manifest::workspace::load_both(cwd)
+        .into_diagnostic()
+        .wrap_err("failed to load workspace config")?;
+    Ok(workspace_catalog_map(&ws_config))
+}
+
+/// Walk up from `start` looking for a directory that contains an
+/// `aube-workspace.yaml` or `pnpm-workspace.yaml` file and return it.
+pub(crate) fn find_workspace_root(start: &std::path::Path) -> miette::Result<std::path::PathBuf> {
+    crate::dirs::find_workspace_root(start).ok_or_else(|| {
+        miette!(
+            "no aube-workspace.yaml or pnpm-workspace.yaml found above {}",
+            start.display()
+        )
+    })
+}
+
+pub(crate) fn select_workspace_packages(
+    cwd: &std::path::Path,
+    filter: &aube_workspace::selector::EffectiveFilter,
+    command: &str,
+) -> miette::Result<Vec<aube_workspace::selector::SelectedPackage>> {
+    let workspace_pkgs = aube_workspace::find_workspace_packages(cwd)
+        .map_err(|e| miette!("failed to discover workspace packages: {e}"))?;
+    if workspace_pkgs.is_empty() {
+        return Err(miette!(
+            "aube {command}: --filter requires a pnpm-workspace.yaml at {}",
+            cwd.display()
+        ));
+    }
+    let matched = aube_workspace::selector::select_workspace_packages(cwd, &workspace_pkgs, filter)
+        .map_err(|e| miette!("invalid --filter selector: {e}"))?;
+    if matched.is_empty() {
+        return Err(miette!(
+            "aube {command}: filter {filter:?} did not match any workspace package"
+        ));
+    }
+    Ok(matched)
+}
+
+/// Resolve a version spec against a full packument. Returns the concrete
+/// version string to look up in the `versions` object.
+///
+/// Resolution order, matching npm/pnpm:
+/// 1. No spec → `dist-tags.latest`
+/// 2. Spec is a dist-tag → `dist-tags[spec]`
+/// 3. Spec is an exact version in `versions` → that version
+/// 4. Spec is a semver range → highest matching version in `versions`
+///
+/// Shared by `aube view` and `aube store add` so fixes land in one place.
+pub(crate) fn resolve_version(packument: &serde_json::Value, spec: Option<&str>) -> Option<String> {
+    let dist_tags = packument.get("dist-tags").and_then(|v| v.as_object());
+    let versions = packument.get("versions").and_then(|v| v.as_object())?;
+
+    let spec = match spec {
+        None | Some("") => {
+            return dist_tags?
+                .get("latest")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+        }
+        Some(s) => s,
+    };
+
+    if let Some(tag) = dist_tags.and_then(|t| t.get(spec)).and_then(|v| v.as_str()) {
+        return Some(tag.to_string());
+    }
+
+    if versions.contains_key(spec) {
+        return Some(spec.to_string());
+    }
+
+    let range: node_semver::Range = spec.parse().ok()?;
+    versions
+        .keys()
+        .filter_map(|v| {
+            v.parse::<node_semver::Version>()
+                .ok()
+                .filter(|parsed| parsed.satisfies(&range))
+                .map(|parsed| (v.clone(), parsed))
+        })
+        .max_by(|a, b| a.1.cmp(&b.1))
+        .map(|(raw, _)| raw)
+}
+
+/// Split `name[@version]` into the package name and optional version spec.
+/// Handles scoped packages (`@scope/name[@version]`) correctly — the first
+/// `@` in a scoped input is the scope sigil, not a version separator.
+///
+/// Returns borrowed slices of the input. Callers that need owned `String`s
+/// or a default like `"latest"` can adapt the result at their call site.
+pub(crate) fn split_name_spec(input: &str) -> (&str, Option<&str>) {
+    if let Some(rest) = input.strip_prefix('@') {
+        // Scoped: @scope/name[@version]
+        if let Some(slash) = rest.find('/') {
+            let after_slash = &rest[slash + 1..];
+            if let Some(at) = after_slash.find('@') {
+                let name_end = 1 + slash + 1 + at;
+                return (&input[..name_end], Some(&input[name_end + 1..]));
+            }
+        }
+        return (input, None);
+    }
+    if let Some(at) = input.find('@') {
+        return (&input[..at], Some(&input[at + 1..]));
+    }
+    (input, None)
+}
+
+/// Percent-encode a package name for npm registry path segments.
+/// `@scope/name` becomes `@scope%2Fname`; the leading `@` stays literal
+/// and only the scope/name slash is encoded. Plain names pass through.
+///
+/// Shared between `publish` and `unpublish` (both target
+/// `{registry}/{name}/...` endpoints) so the two write commands can't
+/// drift on URL shape — the registry routes auth on these paths, so
+/// even a subtle encoding change would break one command silently
+/// while leaving the other working.
+pub(crate) fn encode_package_name(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix('@')
+        && let Some((scope, pkg)) = rest.split_once('/')
+    {
+        return format!("@{scope}%2F{pkg}");
+    }
+    name.to_string()
+}
+
+#[cfg(test)]
+mod encode_package_name_tests {
+    use super::encode_package_name;
+
+    #[test]
+    fn scoped_name_encodes_slash() {
+        assert_eq!(encode_package_name("@scope/pkg"), "@scope%2Fpkg");
+    }
+
+    #[test]
+    fn plain_name_passthrough() {
+        assert_eq!(encode_package_name("lodash"), "lodash");
+    }
+
+    #[test]
+    fn malformed_scoped_name_passthrough() {
+        // `@scope` with no slash isn't a valid package name, but we
+        // shouldn't panic — return it verbatim so the registry can
+        // surface the error.
+        assert_eq!(encode_package_name("@scope"), "@scope");
+    }
+}
+
+#[cfg(test)]
+mod split_name_spec_tests {
+    use super::split_name_spec;
+
+    #[test]
+    fn plain_name() {
+        assert_eq!(split_name_spec("lodash"), ("lodash", None));
+    }
+
+    #[test]
+    fn name_with_version() {
+        assert_eq!(
+            split_name_spec("lodash@4.17.21"),
+            ("lodash", Some("4.17.21"))
+        );
+    }
+
+    #[test]
+    fn name_with_range() {
+        assert_eq!(split_name_spec("lodash@^4"), ("lodash", Some("^4")));
+    }
+
+    #[test]
+    fn name_with_tag() {
+        assert_eq!(split_name_spec("react@next"), ("react", Some("next")));
+    }
+
+    #[test]
+    fn scoped_no_version() {
+        assert_eq!(split_name_spec("@babel/core"), ("@babel/core", None));
+    }
+
+    #[test]
+    fn scoped_with_version() {
+        assert_eq!(
+            split_name_spec("@babel/core@7.0.0"),
+            ("@babel/core", Some("7.0.0"))
+        );
+    }
+}
+
+/// Auto-install if needed, unless disabled.
+pub(crate) async fn ensure_installed(no_install: bool) -> miette::Result<()> {
+    if no_install {
+        return Ok(());
+    }
+
+    let initial_cwd = crate::dirs::cwd()?;
+    // Walk up to the nearest `package.json` so auto-install from a
+    // subdirectory checks (and installs into) the project root.
+    let cwd = crate::dirs::find_project_root(&initial_cwd).unwrap_or(initial_cwd);
+    // Resolve both pieces of auto-install policy in a single
+    // `with_settings_ctx` call so the `.npmrc` + workspace-yaml read
+    // pays off once. `aubeNoAutoInstall` lets a project/workspace opt
+    // out of the staleness check entirely (env alias:
+    // `AUBE_NO_AUTO_INSTALL`). `optimisticRepeatInstall=false`
+    // disables the cheap lockfile/manifest hash short-circuit so every
+    // check becomes a full install — matches pnpm's semantics where
+    // the fast path is opt-out, not a staleness contract.
+    let (skip_auto_install, optimistic_repeat) = with_settings_ctx(&cwd, |ctx| {
+        (
+            aube_settings::resolved::aube_no_auto_install(ctx),
+            aube_settings::resolved::optimistic_repeat_install(ctx),
+        )
+    });
+    if skip_auto_install {
+        return Ok(());
+    }
+    let g = global_frozen_flags();
+    let needs = if optimistic_repeat {
+        crate::state::check_needs_install(&cwd)
+    } else {
+        Some("optimisticRepeatInstall=false".to_string())
+    };
+    let verify_mode = resolve_verify_deps_before_run(&cwd)?;
+    // A global `--frozen-lockfile` / `--no-frozen-lockfile` /
+    // `--prefer-frozen-lockfile` re-triggers the install path even
+    // when the state file says the tree is fresh, so the flag is
+    // honored on every command that auto-installs.
+    let forced_flag = if g.frozen {
+        Some("--frozen-lockfile")
+    } else if g.no_frozen {
+        Some("--no-frozen-lockfile")
+    } else if g.prefer_frozen {
+        Some("--prefer-frozen-lockfile")
+    } else {
+        None
+    };
+    let Some(reason) = needs.or_else(|| forced_flag.map(|f| format!("global {f} flag"))) else {
+        return Ok(());
+    };
+    match verify_mode {
+        VerifyDepsBeforeRun::Skip => return Ok(()),
+        VerifyDepsBeforeRun::Warn => {
+            eprintln!("Dependencies need install before run: {reason}");
+            return Ok(());
+        }
+        VerifyDepsBeforeRun::Error => {
+            return Err(miette!(
+                "dependencies need install before run: {reason}\nRun `aube install`, or set verifyDepsBeforeRun=install to let aube do it automatically."
+            ));
+        }
+        VerifyDepsBeforeRun::Install => {}
+    }
+    eprintln!("Auto-installing: {reason}");
+    let mode = chained_frozen_mode(install::FrozenMode::Prefer);
+    let mut opts = install::InstallOptions::with_mode(mode);
+    opts.strict_no_lockfile = g.frozen;
+    install::run(opts).await?;
+
+    Ok(())
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum VerifyDepsBeforeRun {
+    Install,
+    Warn,
+    Error,
+    Skip,
+}
+
+fn resolve_verify_deps_before_run(cwd: &std::path::Path) -> miette::Result<VerifyDepsBeforeRun> {
+    let npmrc = aube_registry::config::load_npmrc_entries(cwd);
+    let empty_ws = std::collections::BTreeMap::new();
+    let env = aube_settings::values::capture_env();
+    let ctx = aube_settings::ResolveCtx {
+        npmrc: &npmrc,
+        workspace_yaml: &empty_ws,
+        env: &env,
+        cli: &[],
+    };
+    let raw = aube_settings::resolved::verify_deps_before_run(&ctx);
+    Ok(match raw.trim().to_ascii_lowercase().as_str() {
+        "false" | "0" => VerifyDepsBeforeRun::Skip,
+        "warn" => VerifyDepsBeforeRun::Warn,
+        "error" => VerifyDepsBeforeRun::Error,
+        "prompt" | "install" => VerifyDepsBeforeRun::Install,
+        _ => VerifyDepsBeforeRun::Install,
+    })
+}
+
+/// Remove an existing file/dir/symlink at the given path, if present.
+pub(crate) fn remove_existing(path: &std::path::Path) -> miette::Result<()> {
+    if path.symlink_metadata().is_err() {
+        return Ok(());
+    }
+    if path.is_dir() && !path.is_symlink() {
+        std::fs::remove_dir_all(path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to remove {}", path.display()))?;
+    } else {
+        std::fs::remove_file(path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn workspace_importer_path(
+    workspace_root: &std::path::Path,
+    dir: &std::path::Path,
+) -> miette::Result<String> {
+    let rel = dir.strip_prefix(workspace_root).map_err(|_| {
+        miette!(
+            "workspace package {} is outside {}",
+            dir.display(),
+            workspace_root.display()
+        )
+    })?;
+    if rel.as_os_str().is_empty() {
+        Ok(".".to_string())
+    } else {
+        Ok(rel.to_string_lossy().replace('\\', "/"))
+    }
+}
+
+/// Create a directory link (symlink on Unix, NTFS junction on
+/// Windows). Thin re-export of [`aube_linker::create_dir_link`] —
+/// the linker owns the platform-specific implementation so every
+/// directory-link call site in the workspace behaves identically,
+/// including Windows' "junctions not symlinks" choice that keeps
+/// installs working without Developer Mode.
+pub(crate) fn symlink_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    aube_linker::create_dir_link(src, dst)
+}
+
+/// Dep-type filter derived from `--prod` / `--dev` on list-style commands
+/// (`list`, `why`). Both commands take the same two flags with the same
+/// semantics — this enum is the shared derivation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DepFilter {
+    /// Include every dep type.
+    All,
+    /// `--prod`: include `Production` and `Optional`, drop `Dev`.
+    ProdOnly,
+    /// `--dev`: include only `Dev`.
+    DevOnly,
+}
+
+impl DepFilter {
+    /// Collapse the two mutually-exclusive boolean flags into a filter.
+    /// `(true, _)` wins because clap enforces `conflicts_with = "dev"`.
+    pub(crate) fn from_flags(prod: bool, dev: bool) -> Self {
+        match (prod, dev) {
+            (true, _) => Self::ProdOnly,
+            (_, true) => Self::DevOnly,
+            _ => Self::All,
+        }
+    }
+
+    /// Does this filter keep the given dep type?
+    pub(crate) fn keeps(self, dep_type: aube_lockfile::DepType) -> bool {
+        use aube_lockfile::DepType;
+        matches!(
+            (self, dep_type),
+            (Self::All, _)
+                | (Self::ProdOnly, DepType::Production | DepType::Optional)
+                | (Self::DevOnly, DepType::Dev)
+        )
+    }
+}
+
+#[cfg(test)]
+mod dep_filter_tests {
+    use super::*;
+    use aube_lockfile::DepType;
+
+    #[test]
+    fn all_keeps_everything() {
+        let f = DepFilter::from_flags(false, false);
+        assert!(f.keeps(DepType::Production));
+        assert!(f.keeps(DepType::Dev));
+        assert!(f.keeps(DepType::Optional));
+    }
+
+    #[test]
+    fn prod_keeps_production_and_optional() {
+        let f = DepFilter::from_flags(true, false);
+        assert!(f.keeps(DepType::Production));
+        assert!(f.keeps(DepType::Optional));
+        assert!(!f.keeps(DepType::Dev));
+    }
+
+    #[test]
+    fn dev_keeps_only_dev() {
+        let f = DepFilter::from_flags(false, true);
+        assert!(!f.keeps(DepType::Production));
+        assert!(!f.keeps(DepType::Optional));
+        assert!(f.keeps(DepType::Dev));
+    }
+
+    #[test]
+    fn prod_wins_over_dev_when_both_set() {
+        // clap should prevent this combination via conflicts_with, but we
+        // still want deterministic behavior if it ever gets through.
+        let f = DepFilter::from_flags(true, true);
+        assert!(f.keeps(DepType::Production));
+        assert!(!f.keeps(DepType::Dev));
+    }
+}

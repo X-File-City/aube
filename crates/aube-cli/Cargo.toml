@@ -1,0 +1,65 @@
+[package]
+name = "aube-cli"
+description = "Aube CLI — a fast Node.js package manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "aube"
+path = "src/main.rs"
+
+[dependencies]
+aube-lockfile = { workspace = true }
+aube-manifest = { workspace = true }
+aube-registry = { workspace = true }
+aube-resolver = { workspace = true }
+aube-settings = { workspace = true }
+aube-store = { workspace = true }
+aube-linker = { workspace = true }
+aube-scripts = { workspace = true }
+aube-workspace = { workspace = true }
+xx = { workspace = true }
+clap = { workspace = true }
+clap_usage = "2"
+clx = { workspace = true }
+console = "0.16"
+demand = "2"
+reqwest = { workspace = true }
+tokio = { workspace = true }
+miette = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+base64 = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+sigstore-sign = { workspace = true }
+sigstore-oidc = { workspace = true }
+sigstore-types = { workspace = true }
+ambient-id = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+flate2 = { workspace = true }
+glob = { workspace = true }
+node-semver = { workspace = true }
+rayon = { workspace = true }
+tar = { workspace = true }
+tempfile = "3"
+diffy = { workspace = true }
+libc = "0.2"
+pathdiff = "0.2"
+
+[dev-dependencies]
+clap-sort = "1"
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"

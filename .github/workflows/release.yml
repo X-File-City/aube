@@ -1,0 +1,88 @@
+name: release
+
+# Reusable workflow: builds + (on macOS) codesigns the `aube` binary
+# for every target, then uploads each archive onto the draft GitHub
+# release that `release-plz` already created for the tag. Driven by
+# `.github/workflows/release-plz.yml` — not triggered directly on
+# tag push, since release-plz owns the tag/release lifecycle and
+# dispatching on both would race.
+
+permissions:
+  contents: write
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to attach binaries to (e.g. v1.0.0)"
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  upload-assets:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          submodules: recursive
+      - name: Import codesign certs
+        if: startsWith(matrix.os, 'macos')
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.CERTIFICATES_P12 }}
+          p12-password: ${{ secrets.CERTIFICATES_P12_PASS }}
+      - name: Install cross-compilation tools
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-${{ matrix.target }}
+      # taiki-e/upload-rust-binary-action builds via cargo/cross, packages
+      # the binary into a `<bin>-<tag>-<target>.{tar.gz,zip}` archive, and
+      # uploads it onto the existing release for `tag`. On macOS we ask it
+      # to codesign with the Developer ID cert we just imported.
+      - name: Upload binary (macOS signed)
+        if: startsWith(matrix.os, 'macos')
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: aube
+          target: ${{ matrix.target }}
+          ref: refs/tags/${{ inputs.tag }}
+          token: ${{ secrets.AUBE_GH_TOKEN }}
+          codesign: "Developer ID Application: Jeffrey Dickey (4993Y37DX6)"
+          codesign_prefix: dev.jdx.
+      - name: Upload binary (non-macOS)
+        if: ${{ !startsWith(matrix.os, 'macos') }}
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: aube
+          target: ${{ matrix.target }}
+          ref: refs/tags/${{ inputs.tag }}
+          token: ${{ secrets.AUBE_GH_TOKEN }}

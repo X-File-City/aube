@@ -1,0 +1,411 @@
+//! Allowlist/denylist policy for running dependency lifecycle scripts.
+//!
+//! Mirrors pnpm's `createAllowBuildFunction` — given an `allowBuilds`
+//! map (`Record<string, boolean>`) and a `dangerouslyAllowAllBuilds`
+//! flag, produce a function from `(pkgName, version)` to an allow /
+//! deny / unspecified decision. Unspecified means "fall through to the
+//! caller's default," which for aube is always "deny."
+//!
+//! ## Entry shapes
+//!
+//! Keys in the `allowBuilds` map support three forms:
+//!
+//! - `"esbuild"` — bare name, matches every version of the package
+//! - `"esbuild@0.19.0"` — exact version match
+//! - `"esbuild@0.19.0 || 0.20.0"` — exact version union
+//!
+//! Semver ranges are intentionally *not* supported, matching pnpm's
+//! `expandPackageVersionSpecs` behavior: if you pin a version in the
+//! allowlist you're asserting a specific build has been audited, so
+//! range matching would defeat the point.
+//!
+//! Name patterns with `*` are not yet supported — pnpm's `@pnpm/config.matcher`
+//! handles them but they're rare in practice and we can add them later
+//! if users ask.
+
+use aube_manifest::AllowBuildRaw;
+use std::collections::{BTreeMap, HashSet};
+
+/// The decision for a single `(name, version)` lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowDecision {
+    /// Package is explicitly allowed — run its lifecycle scripts.
+    Allow,
+    /// Package is explicitly denied — skip even if a broader rule would allow.
+    Deny,
+    /// No rule matched; caller applies its default (aube denies).
+    Unspecified,
+}
+
+/// Resolved policy for deciding whether a package may run its
+/// lifecycle scripts.
+#[derive(Debug, Clone, Default)]
+pub struct BuildPolicy {
+    allow_all: bool,
+    /// Expanded allow-keys: bare names (match any version) and
+    /// `name@version` strings (match that specific version).
+    allowed: HashSet<String>,
+    denied: HashSet<String>,
+}
+
+impl BuildPolicy {
+    /// A policy that denies every package (the aube default).
+    pub fn deny_all() -> Self {
+        Self::default()
+    }
+
+    /// A policy that allows every package, regardless of the map.
+    /// Corresponds to `--dangerously-allow-all-builds`.
+    pub fn allow_all() -> Self {
+        Self {
+            allow_all: true,
+            ..Self::default()
+        }
+    }
+
+    /// Build from a raw `allowBuilds` map plus pnpm's canonical
+    /// `onlyBuiltDependencies` / `neverBuiltDependencies` flat lists,
+    /// plus the `dangerouslyAllowAllBuilds` flag.
+    ///
+    /// All three sources merge into one allow/deny set — pnpm uses the
+    /// flat lists in most real-world projects, and aube's `allowBuilds`
+    /// map is the superset format. Unrecognized `allowBuilds` value
+    /// shapes are collected in the returned `warnings` vec so the
+    /// caller can surface them through the progress UI.
+    pub fn from_config(
+        allow_builds: &BTreeMap<String, AllowBuildRaw>,
+        only_built: &[String],
+        never_built: &[String],
+        dangerously_allow_all: bool,
+    ) -> (Self, Vec<BuildPolicyError>) {
+        if dangerously_allow_all {
+            return (Self::allow_all(), Vec::new());
+        }
+        let mut allowed = HashSet::new();
+        let mut denied = HashSet::new();
+        let mut warnings = Vec::new();
+
+        for (pattern, value) in allow_builds {
+            let bool_value = match value {
+                AllowBuildRaw::Bool(b) => *b,
+                AllowBuildRaw::Other(raw) => {
+                    warnings.push(BuildPolicyError::UnsupportedValue {
+                        pattern: pattern.clone(),
+                        raw: raw.clone(),
+                    });
+                    continue;
+                }
+            };
+            match expand_spec(pattern) {
+                Ok(expanded) => {
+                    let target = if bool_value {
+                        &mut allowed
+                    } else {
+                        &mut denied
+                    };
+                    target.extend(expanded);
+                }
+                Err(e) => warnings.push(e),
+            }
+        }
+
+        // `onlyBuiltDependencies` / `neverBuiltDependencies` support the
+        // same pattern forms as `allowBuilds` map keys (bare name, exact
+        // version, exact version union), so route them through the same
+        // `expand_spec` — a single `esbuild@0.20.0` pin works in either
+        // format.
+        for pattern in only_built {
+            match expand_spec(pattern) {
+                Ok(expanded) => allowed.extend(expanded),
+                Err(e) => warnings.push(e),
+            }
+        }
+        for pattern in never_built {
+            match expand_spec(pattern) {
+                Ok(expanded) => denied.extend(expanded),
+                Err(e) => warnings.push(e),
+            }
+        }
+
+        (
+            Self {
+                allow_all: false,
+                allowed,
+                denied,
+            },
+            warnings,
+        )
+    }
+
+    /// Decide whether `(name, version)` may run lifecycle scripts.
+    /// Explicit denies always win over allows (mirrors pnpm).
+    pub fn decide(&self, name: &str, version: &str) -> AllowDecision {
+        let with_version = format!("{name}@{version}");
+        if self.denied.contains(name) || self.denied.contains(&with_version) {
+            return AllowDecision::Deny;
+        }
+        if self.allow_all {
+            return AllowDecision::Allow;
+        }
+        if self.allowed.contains(name) || self.allowed.contains(&with_version) {
+            return AllowDecision::Allow;
+        }
+        AllowDecision::Unspecified
+    }
+
+    /// True when the policy would allow something — any rule at all, or
+    /// allow-all mode. Lets callers cheaply skip the whole dep-script
+    /// phase when nothing could possibly run.
+    pub fn has_any_allow_rule(&self) -> bool {
+        self.allow_all || !self.allowed.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum BuildPolicyError {
+    #[error("allowBuilds entry {pattern:?} has unsupported value {raw:?}: expected true/false")]
+    UnsupportedValue { pattern: String, raw: String },
+    #[error("allowBuilds pattern {0:?} contains an invalid version union")]
+    InvalidVersionUnion(String),
+    #[error("allowBuilds pattern {0:?} mixes a wildcard name with a version union")]
+    WildcardWithVersion(String),
+}
+
+/// Parse one entry from the allowBuilds map into the set of strings
+/// that will be matched at decide-time. Mirrors pnpm's
+/// `expandPackageVersionSpecs`.
+fn expand_spec(pattern: &str) -> Result<Vec<String>, BuildPolicyError> {
+    let (name, versions_part) = split_name_and_versions(pattern);
+
+    if versions_part.is_empty() {
+        return Ok(vec![name.to_string()]);
+    }
+    if name.contains('*') {
+        return Err(BuildPolicyError::WildcardWithVersion(pattern.to_string()));
+    }
+
+    let mut out = Vec::new();
+    for raw in versions_part.split("||") {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || !is_exact_semver(trimmed) {
+            return Err(BuildPolicyError::InvalidVersionUnion(pattern.to_string()));
+        }
+        out.push(format!("{name}@{trimmed}"));
+    }
+    Ok(out)
+}
+
+/// Split `pattern` into `(name, version_spec)`, respecting a leading
+/// `@` for scoped packages so `@scope/foo@1.0.0` parses correctly.
+fn split_name_and_versions(pattern: &str) -> (&str, &str) {
+    let scoped = pattern.starts_with('@');
+    let search_from = if scoped { 1 } else { 0 };
+    match pattern[search_from..].find('@') {
+        Some(rel) => {
+            let at = search_from + rel;
+            (&pattern[..at], &pattern[at + 1..])
+        }
+        None => (pattern, ""),
+    }
+}
+
+/// Minimal exact-semver validator — accepts `MAJOR.MINOR.PATCH` plus an
+/// optional `-prerelease` / `+build` tail. We intentionally don't pull
+/// in the `semver` crate here because the file is tiny and this is the
+/// only place in aube-scripts that cares about semver shape.
+fn is_exact_semver(s: &str) -> bool {
+    // Strip build metadata; it doesn't affect equality for our purposes.
+    let core = s.split('+').next().unwrap_or(s);
+    // Strip pre-release; the shape just needs to parse as numeric triple.
+    let main = core.split('-').next().unwrap_or(core);
+    let parts: Vec<&str> = main.split('.').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    parts
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy(pairs: &[(&str, bool)]) -> BuildPolicy {
+        let map: BTreeMap<String, AllowBuildRaw> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), AllowBuildRaw::Bool(*v)))
+            .collect();
+        let (p, errs) = BuildPolicy::from_config(&map, &[], &[], false);
+        assert!(errs.is_empty(), "unexpected warnings: {errs:?}");
+        p
+    }
+
+    #[test]
+    fn bare_name_allows_any_version() {
+        let p = policy(&[("esbuild", true)]);
+        assert_eq!(p.decide("esbuild", "0.19.0"), AllowDecision::Allow);
+        assert_eq!(p.decide("esbuild", "0.25.0"), AllowDecision::Allow);
+        assert_eq!(p.decide("rollup", "4.0.0"), AllowDecision::Unspecified);
+    }
+
+    #[test]
+    fn exact_version_is_strict() {
+        let p = policy(&[("esbuild@0.19.0", true)]);
+        assert_eq!(p.decide("esbuild", "0.19.0"), AllowDecision::Allow);
+        assert_eq!(p.decide("esbuild", "0.19.1"), AllowDecision::Unspecified);
+    }
+
+    #[test]
+    fn version_union_splits() {
+        let p = policy(&[("esbuild@0.19.0 || 0.20.1", true)]);
+        assert_eq!(p.decide("esbuild", "0.19.0"), AllowDecision::Allow);
+        assert_eq!(p.decide("esbuild", "0.20.1"), AllowDecision::Allow);
+        assert_eq!(p.decide("esbuild", "0.20.0"), AllowDecision::Unspecified);
+    }
+
+    #[test]
+    fn scoped_package_parses() {
+        let p = policy(&[("@swc/core@1.3.0", true)]);
+        assert_eq!(p.decide("@swc/core", "1.3.0"), AllowDecision::Allow);
+        assert_eq!(p.decide("@swc/core", "1.4.0"), AllowDecision::Unspecified);
+    }
+
+    #[test]
+    fn scoped_bare_name() {
+        let p = policy(&[("@swc/core", true)]);
+        assert_eq!(p.decide("@swc/core", "1.3.0"), AllowDecision::Allow);
+    }
+
+    #[test]
+    fn dangerously_allow_all_bypasses_deny_list() {
+        // pnpm's `createAllowBuildFunction` short-circuits to `() => true`
+        // when `dangerouslyAllowAllBuilds` is set, dropping the entire
+        // allowBuilds map — including any `false` entries. Pin that
+        // behavior so a future refactor doesn't accidentally start
+        // honoring deny rules under allow-all.
+        let mut map = BTreeMap::new();
+        map.insert("esbuild".into(), AllowBuildRaw::Bool(false));
+        let (p, errs) = BuildPolicy::from_config(&map, &[], &[], true);
+        assert!(errs.is_empty());
+        assert_eq!(p.decide("esbuild", "0.19.0"), AllowDecision::Allow);
+    }
+
+    #[test]
+    fn deny_wins_over_allow_when_both_listed() {
+        let map: BTreeMap<String, AllowBuildRaw> = [
+            ("esbuild".to_string(), AllowBuildRaw::Bool(true)),
+            ("esbuild@0.19.0".to_string(), AllowBuildRaw::Bool(false)),
+        ]
+        .into_iter()
+        .collect();
+        let (p, errs) = BuildPolicy::from_config(&map, &[], &[], false);
+        assert!(errs.is_empty());
+        assert_eq!(p.decide("esbuild", "0.19.0"), AllowDecision::Deny);
+        assert_eq!(p.decide("esbuild", "0.19.1"), AllowDecision::Allow);
+    }
+
+    #[test]
+    fn deny_all_is_default() {
+        let p = BuildPolicy::deny_all();
+        assert_eq!(p.decide("anything", "1.0.0"), AllowDecision::Unspecified);
+        assert!(!p.has_any_allow_rule());
+    }
+
+    #[test]
+    fn allow_all_flag() {
+        let p = BuildPolicy::allow_all();
+        assert_eq!(p.decide("anything", "1.0.0"), AllowDecision::Allow);
+        assert!(p.has_any_allow_rule());
+    }
+
+    #[test]
+    fn invalid_version_union_reports_warning() {
+        let map: BTreeMap<String, AllowBuildRaw> = [(
+            "esbuild@not-a-version".to_string(),
+            AllowBuildRaw::Bool(true),
+        )]
+        .into_iter()
+        .collect();
+        let (p, errs) = BuildPolicy::from_config(&map, &[], &[], false);
+        assert_eq!(errs.len(), 1);
+        // The broken entry should not leak into the allowed set.
+        assert_eq!(p.decide("esbuild", "0.19.0"), AllowDecision::Unspecified);
+    }
+
+    #[test]
+    fn non_bool_value_reports_warning() {
+        let map: BTreeMap<String, AllowBuildRaw> =
+            [("esbuild".to_string(), AllowBuildRaw::Other("maybe".into()))]
+                .into_iter()
+                .collect();
+        let (_, errs) = BuildPolicy::from_config(&map, &[], &[], false);
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn only_built_dependencies_allowlist_coexists_with_allow_builds() {
+        // pnpm's canonical `onlyBuiltDependencies` flat list is additive
+        // with `allowBuilds`, so both sources populate the same allowed
+        // set. Same pattern vocabulary — bare name or exact version.
+        let map = BTreeMap::new();
+        let only_built = vec!["esbuild".to_string(), "@swc/core@1.3.0".to_string()];
+        let (p, errs) = BuildPolicy::from_config(&map, &only_built, &[], false);
+        assert!(errs.is_empty());
+        assert_eq!(p.decide("esbuild", "0.19.0"), AllowDecision::Allow);
+        assert_eq!(p.decide("@swc/core", "1.3.0"), AllowDecision::Allow);
+        assert_eq!(p.decide("@swc/core", "1.4.0"), AllowDecision::Unspecified);
+        assert!(p.has_any_allow_rule());
+    }
+
+    #[test]
+    fn never_built_dependencies_denies() {
+        let map = BTreeMap::new();
+        let only_built = vec!["esbuild".to_string()];
+        let never_built = vec!["esbuild@0.19.0".to_string()];
+        let (p, errs) = BuildPolicy::from_config(&map, &only_built, &never_built, false);
+        assert!(errs.is_empty());
+        assert_eq!(p.decide("esbuild", "0.19.0"), AllowDecision::Deny);
+        assert_eq!(p.decide("esbuild", "0.20.0"), AllowDecision::Allow);
+    }
+
+    #[test]
+    fn never_built_beats_allow_builds_map() {
+        // Cross-source precedence: a bare-name deny in
+        // `neverBuiltDependencies` overrides a bare-name allow in the
+        // `allowBuilds` map. Mirrors the in-map deny-wins test above.
+        let map: BTreeMap<String, AllowBuildRaw> =
+            [("esbuild".to_string(), AllowBuildRaw::Bool(true))]
+                .into_iter()
+                .collect();
+        let never_built = vec!["esbuild".to_string()];
+        let (p, errs) = BuildPolicy::from_config(&map, &[], &never_built, false);
+        assert!(errs.is_empty());
+        assert_eq!(p.decide("esbuild", "0.19.0"), AllowDecision::Deny);
+    }
+
+    #[test]
+    fn splits_scoped_correctly() {
+        assert_eq!(
+            split_name_and_versions("@swc/core@1.3.0"),
+            ("@swc/core", "1.3.0")
+        );
+        assert_eq!(split_name_and_versions("@swc/core"), ("@swc/core", ""));
+        assert_eq!(
+            split_name_and_versions("esbuild@0.19.0"),
+            ("esbuild", "0.19.0")
+        );
+        assert_eq!(split_name_and_versions("esbuild"), ("esbuild", ""));
+    }
+
+    #[test]
+    fn semver_shape() {
+        assert!(is_exact_semver("1.2.3"));
+        assert!(is_exact_semver("0.19.0"));
+        assert!(is_exact_semver("1.0.0-alpha"));
+        assert!(is_exact_semver("1.0.0+build.42"));
+        assert!(!is_exact_semver("1.2"));
+        assert!(!is_exact_semver("^1.2.3"));
+        assert!(!is_exact_semver("1.x.0"));
+    }
+}

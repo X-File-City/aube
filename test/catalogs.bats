@@ -1,0 +1,368 @@
+#!/usr/bin/env bats
+
+setup() {
+	load 'test_helper/common_setup'
+	_common_setup
+}
+
+teardown() {
+	_common_teardown
+}
+
+_setup_catalog_workspace() {
+	cat >pnpm-workspace.yaml <<-'EOF'
+		packages:
+		  - packages/*
+		catalog:
+		  is-odd: ^3.0.1
+		catalogs:
+		  evens:
+		    is-even: ^1.0.0
+	EOF
+
+	cat >package.json <<-'EOF'
+		{
+		  "name": "aube-test-catalogs",
+		  "version": "0.0.0",
+		  "private": true
+		}
+	EOF
+
+	mkdir -p packages/lib packages/app
+
+	cat >packages/lib/package.json <<-'EOF'
+		{
+		  "name": "@test/lib",
+		  "version": "1.0.0",
+		  "main": "index.js",
+		  "dependencies": {
+		    "is-odd": "catalog:"
+		  }
+		}
+	EOF
+	echo "module.exports = require('is-odd');" >packages/lib/index.js
+
+	cat >packages/app/package.json <<-'EOF'
+		{
+		  "name": "@test/app",
+		  "version": "1.0.0",
+		  "dependencies": {
+		    "is-even": "catalog:evens"
+		  }
+		}
+	EOF
+}
+
+@test "aube install: catalog: resolves from default catalog" {
+	_setup_catalog_workspace
+
+	run aube install
+	assert_success
+
+	assert_dir_exists packages/lib/node_modules/is-odd
+	assert_dir_exists packages/app/node_modules/is-even
+}
+
+@test "aube install: lockfile records catalogs section" {
+	_setup_catalog_workspace
+	aube install
+
+	run grep -A2 '^catalogs:' aube-lock.yaml
+	assert_success
+	assert_output --partial "default"
+
+	run grep -A2 "^  default:" aube-lock.yaml
+	assert_success
+
+	run grep "specifier: \\^3.0.1" aube-lock.yaml
+	assert_success
+}
+
+@test "aube install: importer entries keep catalog: specifier" {
+	_setup_catalog_workspace
+	aube install
+
+	# `lib`'s is-odd dep should record `specifier: 'catalog:'`, not the
+	# resolved range.
+	run grep -A1 "^      is-odd:" aube-lock.yaml
+	assert_success
+	assert_output --partial "catalog:"
+}
+
+@test "aube install: unknown catalog reference fails fast" {
+	mkdir -p packages/lib
+	cat >pnpm-workspace.yaml <<-'EOF'
+		packages:
+		  - packages/*
+		catalog:
+		  is-odd: ^3.0.1
+	EOF
+	cat >package.json <<-'EOF'
+		{ "name": "aube-test", "version": "0.0.0", "private": true }
+	EOF
+	cat >packages/lib/package.json <<-'EOF'
+		{
+		  "name": "@test/lib",
+		  "version": "1.0.0",
+		  "dependencies": { "is-even": "catalog:" }
+		}
+	EOF
+
+	run aube install
+	assert_failure
+	assert_output --partial "catalog"
+}
+
+@test "aube install: unused workspace catalog entries don't trigger drift" {
+	# Regression: declared-but-unreferenced catalog entries used to be
+	# flagged as drift on every run, breaking --frozen-lockfile and
+	# forcing a re-resolve under FrozenMode::Prefer.
+	mkdir -p packages/lib
+	cat >pnpm-workspace.yaml <<-'EOF'
+		packages:
+		  - packages/*
+		catalog:
+		  is-odd: ^3.0.1
+		  is-even: ^1.0.0
+	EOF
+	cat >package.json <<-'EOF'
+		{ "name": "aube-test", "version": "0.0.0", "private": true }
+	EOF
+	cat >packages/lib/package.json <<-'EOF'
+		{
+		  "name": "@test/lib",
+		  "version": "1.0.0",
+		  "dependencies": { "is-odd": "catalog:" }
+		}
+	EOF
+
+	aube install
+	# Frozen-mode reinstall must succeed: drift check should ignore the
+	# unreferenced is-even entry rather than treating it as "added".
+	run aube install --frozen-lockfile
+	assert_success
+}
+
+@test "aube add: succeeds with an existing catalog: dep in package.json" {
+	# Regression: add/remove/update used to build resolvers without
+	# catalogs, so any catalog: ref in package.json hard-failed with
+	# UnknownCatalogRef when those commands ran.
+	cat >pnpm-workspace.yaml <<-'EOF'
+		catalog:
+		  is-odd: ^3.0.1
+	EOF
+	cat >package.json <<-'EOF'
+		{
+		  "name": "aube-test",
+		  "version": "0.0.0",
+		  "dependencies": {
+		    "is-odd": "catalog:"
+		  }
+		}
+	EOF
+
+	run aube add is-even@^1.0.0
+	assert_success
+	assert_dir_exists node_modules/is-odd
+	assert_dir_exists node_modules/is-even
+}
+
+@test "aube install: editing the catalog re-resolves the lockfile" {
+	_setup_catalog_workspace
+	aube install
+	assert_file_exists aube-lock.yaml
+
+	# Bump the default-catalog spec; the resolver must notice and re-write.
+	cat >pnpm-workspace.yaml <<-'EOF'
+		packages:
+		  - packages/*
+		catalog:
+		  is-odd: ^3.0.0
+		catalogs:
+		  evens:
+		    is-even: ^1.0.0
+	EOF
+
+	run aube install
+	assert_success
+
+	run grep "specifier: \\^3.0.0" aube-lock.yaml
+	assert_success
+}
+
+@test "aube add: catalogMode=prefer rewrites matching dep to catalog:" {
+	cat >pnpm-workspace.yaml <<-'EOF'
+		catalog:
+		  is-odd: ^3.0.1
+	EOF
+	cat >package.json <<-'EOF'
+		{
+		  "name": "aube-test",
+		  "version": "0.0.0"
+		}
+	EOF
+	echo "catalogMode=prefer" >>.npmrc
+
+	run aube add is-odd@^3.0.1
+	assert_success
+
+	# Manifest records the catalog reference, not the bare range.
+	run grep "\"is-odd\": \"catalog:\"" package.json
+	assert_success
+	assert_dir_exists node_modules/is-odd
+}
+
+@test "aube add: catalogMode=prefer falls back on incompatible range" {
+	cat >pnpm-workspace.yaml <<-'EOF'
+		catalog:
+		  is-odd: ^3.0.1
+	EOF
+	cat >package.json <<-'EOF'
+		{ "name": "aube-test", "version": "0.0.0" }
+	EOF
+	echo "catalogMode=prefer" >>.npmrc
+
+	# Range incompatible with the catalog entry falls back to manual —
+	# catalog:'s range doesn't cover ^0.1.0, so prefer should not rewrite.
+	run aube add is-odd@^0.1.0
+	assert_success
+
+	run grep "\"is-odd\": \"catalog:\"" package.json
+	assert_failure
+}
+
+@test "aube add: catalogMode=strict errors on mismatched range" {
+	cat >pnpm-workspace.yaml <<-'EOF'
+		catalog:
+		  is-odd: ^3.0.1
+	EOF
+	cat >package.json <<-'EOF'
+		{ "name": "aube-test", "version": "0.0.0" }
+	EOF
+	echo "catalogMode=strict" >>.npmrc
+
+	run aube add is-odd@^0.1.0
+	assert_failure
+	assert_output --partial "catalogMode=strict"
+}
+
+@test "aube add: catalogMode=strict rewrites when range is implicit" {
+	cat >pnpm-workspace.yaml <<-'EOF'
+		catalog:
+		  is-odd: ^3.0.1
+	EOF
+	cat >package.json <<-'EOF'
+		{ "name": "aube-test", "version": "0.0.0" }
+	EOF
+	echo "catalogMode=strict" >>.npmrc
+
+	run aube add is-odd
+	assert_success
+	run grep "\"is-odd\": \"catalog:\"" package.json
+	assert_success
+}
+
+@test "aube add: catalogMode=strict prints the catalog-resolved version" {
+	# Regression: a bare `aube add <pkg>` used to print the version
+	# `latest` resolved to, even when the catalog rewrite redirected
+	# resolution to a different range. `is-odd`'s `latest` tag is
+	# `3.0.1`, but the catalog here pins `^0.1.0` — the printed and
+	# installed versions must both come from the catalog's range.
+	cat >pnpm-workspace.yaml <<-'EOF'
+		catalog:
+		  is-odd: ^0.1.0
+	EOF
+	cat >package.json <<-'EOF'
+		{ "name": "aube-test", "version": "0.0.0" }
+	EOF
+	echo "catalogMode=strict" >>.npmrc
+
+	run aube add is-odd
+	assert_success
+	assert_output --partial "is-odd@0.1.2 (specifier: catalog:)"
+	refute_output --partial "is-odd@3.0.1 (specifier: catalog:)"
+}
+
+@test "aube add: default manual mode writes the bare range" {
+	cat >pnpm-workspace.yaml <<-'EOF'
+		catalog:
+		  is-odd: ^3.0.1
+	EOF
+	cat >package.json <<-'EOF'
+		{ "name": "aube-test", "version": "0.0.0" }
+	EOF
+
+	run aube add is-odd@^3.0.1
+	assert_success
+
+	# Manual mode preserves the caller's spec verbatim — no catalog rewrite.
+	run grep "\"is-odd\": \"catalog:\"" package.json
+	assert_failure
+	run grep "\"is-odd\":" package.json
+	assert_success
+}
+
+@test "aube install: cleanupUnusedCatalogs drops unreferenced entries" {
+	mkdir -p packages/lib
+	cat >pnpm-workspace.yaml <<-'EOF'
+		packages:
+		  - packages/*
+		catalog:
+		  is-odd: ^3.0.1
+		  is-even: ^1.0.0
+		catalogs:
+		  evens:
+		    is-even: ^1.0.0
+	EOF
+	cat >package.json <<-'EOF'
+		{ "name": "aube-test", "version": "0.0.0", "private": true }
+	EOF
+	cat >packages/lib/package.json <<-'EOF'
+		{
+		  "name": "@test/lib",
+		  "version": "1.0.0",
+		  "dependencies": { "is-odd": "catalog:" }
+		}
+	EOF
+	echo "cleanupUnusedCatalogs=true" >>.npmrc
+
+	run aube install
+	assert_success
+
+	# The unreferenced default-catalog entry and the empty `evens`
+	# named catalog must be pruned; the used entry survives.
+	run grep "is-odd" pnpm-workspace.yaml
+	assert_success
+	run grep "is-even" pnpm-workspace.yaml
+	assert_failure
+	run grep "^catalogs:" pnpm-workspace.yaml
+	assert_failure
+}
+
+@test "aube install: cleanupUnusedCatalogs=false leaves the workspace yaml alone" {
+	mkdir -p packages/lib
+	cat >pnpm-workspace.yaml <<-'EOF'
+		packages:
+		  - packages/*
+		catalog:
+		  is-odd: ^3.0.1
+		  is-even: ^1.0.0
+	EOF
+	cat >package.json <<-'EOF'
+		{ "name": "aube-test", "version": "0.0.0", "private": true }
+	EOF
+	cat >packages/lib/package.json <<-'EOF'
+		{
+		  "name": "@test/lib",
+		  "version": "1.0.0",
+		  "dependencies": { "is-odd": "catalog:" }
+		}
+	EOF
+
+	# Snapshot the file before so we can compare byte-for-byte.
+	before="$(cat pnpm-workspace.yaml)"
+	run aube install
+	assert_success
+	after="$(cat pnpm-workspace.yaml)"
+	[ "$before" = "$after" ]
+}

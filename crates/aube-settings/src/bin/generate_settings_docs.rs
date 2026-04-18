@@ -1,0 +1,425 @@
+use aube_settings::SettingMeta;
+use std::fmt::Write as _;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const COMMAND: &str = "cargo run -p aube-settings --bin generate-settings-docs";
+
+#[derive(Clone, Copy)]
+enum SourceFilter {
+    All,
+    Npmrc,
+    WorkspaceYaml,
+    Env,
+    Cli,
+}
+
+#[derive(Clone, Copy)]
+struct Page {
+    path: &'static str,
+    title: &'static str,
+    description: &'static str,
+    filter: SourceFilter,
+}
+
+struct SettingRef<'a> {
+    meta: &'a SettingMeta,
+    category: String,
+}
+
+fn main() {
+    let root = workspace_root();
+    let settings_path = root.join("settings.toml");
+    let out_dir = root.join("docs/settings");
+    let raw = fs::read_to_string(&settings_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", settings_path.display()));
+
+    let ordered = ordered_settings(&raw)
+        .into_iter()
+        .map(|(name, category)| {
+            let meta = aube_settings::find(&name).unwrap_or_else(|| {
+                panic!("settings.toml entry `{name}` missing from generated metadata")
+            });
+            SettingRef { meta, category }
+        })
+        .collect::<Vec<_>>();
+
+    fs::create_dir_all(&out_dir)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", out_dir.display()));
+
+    for page in pages() {
+        let markdown = render_page(page, &ordered);
+        let path = out_dir.join(page.path);
+        fs::write(&path, markdown)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+        println!("generated {}", path.strip_prefix(&root).unwrap().display());
+    }
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+fn pages() -> [Page; 5] {
+    [
+        Page {
+            path: "index.md",
+            title: "Settings",
+            description: "Every setting tracked by `settings.toml`, grouped the same way as the registry.",
+            filter: SourceFilter::All,
+        },
+        Page {
+            path: "npmrc.md",
+            title: ".npmrc Settings",
+            description: "Settings that can be read from project or user `.npmrc` files.",
+            filter: SourceFilter::Npmrc,
+        },
+        Page {
+            path: "workspace-yaml.md",
+            title: "Workspace YAML Settings",
+            description: "Settings that can be read from `aube-workspace.yaml`; `pnpm-workspace.yaml` remains a migration and compatibility source.",
+            filter: SourceFilter::WorkspaceYaml,
+        },
+        Page {
+            path: "env.md",
+            title: "Environment Settings",
+            description: "Settings that can be read from environment variables, including pnpm-compatible `NPM_CONFIG_*` aliases.",
+            filter: SourceFilter::Env,
+        },
+        Page {
+            path: "cli.md",
+            title: "CLI Settings",
+            description: "Settings that have a CLI flag source.",
+            filter: SourceFilter::Cli,
+        },
+    ]
+}
+
+fn ordered_settings(raw: &str) -> Vec<(String, String)> {
+    let mut current_category = "Other".to_string();
+    let mut out = Vec::new();
+
+    for line in raw.lines() {
+        if let Some(category) = parse_category(line) {
+            current_category = category;
+            continue;
+        }
+
+        if let Some(name) = parse_table_header(line) {
+            out.push((name, current_category.clone()));
+        }
+    }
+
+    out
+}
+
+fn parse_category(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("# ") || !trimmed.contains("====") {
+        return None;
+    }
+    let category = trimmed
+        .trim_start_matches('#')
+        .trim()
+        .trim_matches('=')
+        .trim();
+    if category.is_empty() {
+        None
+    } else {
+        Some(category.to_string())
+    }
+}
+
+fn parse_table_header(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') || trimmed.contains('=') {
+        return None;
+    }
+
+    let inner = &trimmed[1..trimmed.len() - 1];
+    if let Some(rest) = inner.strip_prefix('"') {
+        let mut escaped = false;
+        let mut name = String::new();
+        for c in rest.chars() {
+            if escaped {
+                name.push(c);
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                return Some(name);
+            } else {
+                name.push(c);
+            }
+        }
+        None
+    } else {
+        Some(inner.to_string())
+    }
+}
+
+fn render_page(page: Page, settings: &[SettingRef<'_>]) -> String {
+    let visible = settings
+        .iter()
+        .filter(|setting| matches_filter(setting.meta, page.filter))
+        .collect::<Vec<_>>();
+
+    let mut out = String::new();
+    writeln!(out, "<!-- @generated by {COMMAND} -->").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "# {}", page.title).unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "{}", page.description).unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "Aube generates this page from [`settings.toml`](https://github.com/endevco/aube/blob/main/settings.toml). Edit that registry and rerun `{COMMAND}` instead of editing this page by hand."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+
+    render_nav(&mut out, page.filter);
+    render_summary(&mut out, &visible);
+    render_settings(&mut out, &visible, page.filter);
+
+    out
+}
+
+fn matches_filter(setting: &SettingMeta, filter: SourceFilter) -> bool {
+    match filter {
+        SourceFilter::All => true,
+        SourceFilter::Npmrc => !setting.npmrc_keys.is_empty(),
+        SourceFilter::WorkspaceYaml => !setting.workspace_yaml_keys.is_empty(),
+        SourceFilter::Env => !setting.env_vars.is_empty(),
+        SourceFilter::Cli => !setting.cli_flags.is_empty(),
+    }
+}
+
+fn render_nav(out: &mut String, current: SourceFilter) {
+    writeln!(out, "## Views").unwrap();
+    writeln!(out).unwrap();
+    for (filter, label, href) in [
+        (SourceFilter::All, "All settings", "/settings/"),
+        (SourceFilter::Npmrc, ".npmrc", "/settings/npmrc"),
+        (
+            SourceFilter::WorkspaceYaml,
+            "Workspace YAML",
+            "/settings/workspace-yaml",
+        ),
+        (SourceFilter::Env, "Environment", "/settings/env"),
+        (SourceFilter::Cli, "CLI flags", "/settings/cli"),
+    ] {
+        if same_filter(current, filter) {
+            writeln!(out, "- **{label}**").unwrap();
+        } else {
+            writeln!(out, "- [{label}]({href})").unwrap();
+        }
+    }
+    writeln!(out).unwrap();
+}
+
+fn same_filter(a: SourceFilter, b: SourceFilter) -> bool {
+    std::mem::discriminant(&a) == std::mem::discriminant(&b)
+}
+
+fn render_summary(out: &mut String, settings: &[&SettingRef<'_>]) {
+    let implemented = settings.iter().filter(|s| s.meta.implemented).count();
+    writeln!(out, "## Summary").unwrap();
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "{} settings are listed here. {} are currently implemented.",
+        settings.len(),
+        implemented
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "| Setting | Type | Status | Summary |").unwrap();
+    writeln!(out, "| --- | --- | --- | --- |").unwrap();
+    for setting in settings {
+        writeln!(
+            out,
+            "| [{}](#{}) | {} | {} | {} |",
+            code_span(setting.meta.name),
+            setting_anchor(setting.meta.name),
+            table_code_cell(setting.meta.type_),
+            status(setting.meta.implemented),
+            table_text_cell(setting.meta.description),
+        )
+        .unwrap();
+    }
+    writeln!(out).unwrap();
+}
+
+fn render_settings(out: &mut String, settings: &[&SettingRef<'_>], filter: SourceFilter) {
+    let mut categories = Vec::new();
+    for setting in settings {
+        if !categories.contains(&setting.category.as_str()) {
+            categories.push(setting.category.as_str());
+        }
+    }
+
+    for category in categories {
+        writeln!(out, "## {category}").unwrap();
+        writeln!(out).unwrap();
+        for setting in settings
+            .iter()
+            .filter(|setting| setting.category == category)
+        {
+            render_setting(out, setting.meta, filter);
+        }
+    }
+}
+
+fn render_setting(out: &mut String, setting: &SettingMeta, filter: SourceFilter) {
+    writeln!(
+        out,
+        "### {} {{#{}}}",
+        code_span(setting.name),
+        setting_anchor(setting.name)
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "{}", markdown_text_escape(setting.description)).unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "- Type: {}", code_span(setting.type_)).unwrap();
+    writeln!(out, "- Default: {}", code_span(setting.default)).unwrap();
+    writeln!(out, "- Status: {}", status(setting.implemented)).unwrap();
+    writeln!(out, "- Added to registry: {}", code_span(setting.since)).unwrap();
+    render_sources(out, setting, filter);
+    writeln!(out).unwrap();
+
+    if !setting.docs.trim().is_empty() {
+        writeln!(out, "{}", markdown_text_escape(setting.docs.trim())).unwrap();
+        writeln!(out).unwrap();
+    }
+
+    if !setting.examples.is_empty() {
+        writeln!(out, "Examples:").unwrap();
+        writeln!(out).unwrap();
+        for example in setting.examples {
+            writeln!(out, "- {}", code_span(example)).unwrap();
+        }
+        writeln!(out).unwrap();
+    }
+}
+
+fn render_sources(out: &mut String, setting: &SettingMeta, filter: SourceFilter) {
+    match filter {
+        SourceFilter::All => {
+            source_line(out, "CLI flags", setting.cli_flags);
+            source_line(out, "Environment", setting.env_vars);
+            source_line(out, ".npmrc keys", setting.npmrc_keys);
+            source_line(out, "Workspace YAML keys", setting.workspace_yaml_keys);
+        }
+        SourceFilter::Npmrc => source_line(out, ".npmrc keys", setting.npmrc_keys),
+        SourceFilter::WorkspaceYaml => {
+            source_line(out, "Workspace YAML keys", setting.workspace_yaml_keys)
+        }
+        SourceFilter::Env => source_line(out, "Environment", setting.env_vars),
+        SourceFilter::Cli => source_line(out, "CLI flags", setting.cli_flags),
+    }
+}
+
+fn source_line(out: &mut String, label: &str, values: &[&str]) {
+    if values.is_empty() {
+        writeln!(out, "- {label}: none").unwrap();
+        return;
+    }
+    let values = values.iter().map(|v| code_span(v)).collect::<Vec<_>>();
+    writeln!(out, "- {label}: {}", values.join(", ")).unwrap();
+}
+
+fn status(implemented: bool) -> &'static str {
+    if implemented {
+        "implemented"
+    } else {
+        "planned"
+    }
+}
+
+fn code_span(value: &str) -> String {
+    if value.contains('`') {
+        format!("`` {value} ``")
+    } else {
+        format!("`{value}`")
+    }
+}
+
+fn table_code_cell(value: &str) -> String {
+    code_span(value).replace('|', "\\|").replace('\n', " ")
+}
+
+fn table_text_cell(value: &str) -> String {
+    html_escape(value).replace('|', "\\|").replace('\n', " ")
+}
+
+fn slug(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() {
+                Some(c.to_ascii_lowercase())
+            } else if c == '-' || c == '_' || c == '.' || c.is_whitespace() {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn setting_anchor(name: &str) -> String {
+    format!("setting-{}", slug(name))
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn markdown_text_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    let mut in_code = false;
+
+    for c in value.chars() {
+        match c {
+            '`' => {
+                in_code = !in_code;
+                escaped.push(c);
+            }
+            '<' if !in_code => escaped.push_str("&lt;"),
+            '>' if !in_code => escaped.push_str("&gt;"),
+            _ => escaped.push(c),
+        }
+    }
+
+    escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_span_leaves_angle_brackets_for_markdown_to_escape() {
+        assert_eq!(code_span("list<string>"), "`list<string>`");
+    }
+
+    #[test]
+    fn markdown_text_escape_preserves_inline_code_angle_brackets() {
+        assert_eq!(
+            markdown_text_escape("Run `aube run <script>` from <project>."),
+            "Run `aube run <script>` from &lt;project&gt;."
+        );
+    }
+}

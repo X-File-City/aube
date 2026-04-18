@@ -1,0 +1,282 @@
+#!/usr/bin/env bats
+
+setup() {
+	load 'test_helper/common_setup'
+	_common_setup
+}
+
+teardown() {
+	_common_teardown
+}
+
+_write_publishable_pkg() {
+	cat >package.json <<-'EOF'
+		{
+		  "name": "publish-smoke",
+		  "version": "0.1.0",
+		  "main": "index.js",
+		  "files": ["index.js"]
+		}
+	EOF
+	cat >index.js <<-'EOF'
+		module.exports = 1
+	EOF
+}
+
+@test "aube publish --dry-run reports the target without uploading" {
+	_write_publishable_pkg
+
+	run aube publish --dry-run --registry=https://r.example.com/
+	assert_success
+	assert_output --partial "publish-smoke@0.1.0"
+	assert_output --partial "dry run"
+	assert_output --partial "https://r.example.com/publish-smoke"
+	assert_output --partial "index.js"
+}
+
+@test "aube publish --dry-run URL-encodes scoped names" {
+	cat >package.json <<-'EOF'
+		{
+		  "name": "@aube-fixture/publish",
+		  "version": "0.0.1",
+		  "files": ["index.js"]
+		}
+	EOF
+	cat >index.js <<'EOF'
+module.exports = 0
+EOF
+
+	run aube publish --dry-run --registry=https://r.example.com/
+	assert_success
+	assert_output --partial "@aube-fixture/publish@0.0.1"
+	assert_output --partial "https://r.example.com/@aube-fixture%2Fpublish"
+}
+
+@test "aube publish errors without an auth token" {
+	_write_publishable_pkg
+
+	run aube publish --registry=https://r.example.com/
+	assert_failure
+	assert_output --partial "no auth token"
+}
+
+@test "aube publish --provenance errors outside an OIDC-capable CI" {
+	_write_publishable_pkg
+
+	# Wipe any ambient CI env the BATS runner might have inherited — we're
+	# asserting that, with no OIDC provider in sight, the flag fails loud
+	# rather than silently publishing unsigned.
+	unset GITHUB_ACTIONS ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
+	unset GITLAB_CI BUILDKITE CIRCLECI
+
+	# Seed a fake auth token so we fail on the provenance step, not on
+	# the auth lookup that would short-circuit earlier.
+	echo "//r.example.com/:_authToken=fake" >.npmrc
+
+	run aube publish --provenance --registry=https://r.example.com/
+	assert_failure
+	assert_output --partial "--provenance requires an OIDC-capable CI environment"
+}
+
+@test "aube publish --dry-run --provenance probes OIDC instead of skipping" {
+	_write_publishable_pkg
+
+	# Same ambient-wipe as above — a dry-run that silently succeeds when
+	# OIDC is missing would give users a false green light while validating
+	# their CI setup, so dry-run mode must still fail on missing creds.
+	unset GITHUB_ACTIONS ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN
+	unset GITLAB_CI BUILDKITE CIRCLECI
+
+	run aube publish --dry-run --provenance --registry=https://r.example.com/
+	assert_failure
+	assert_output --partial "--provenance requires an OIDC-capable CI environment"
+}
+
+_setup_workspace_fixture() {
+	cp -r "$PROJECT_ROOT/fixtures/workspace/"* .
+}
+
+@test "aube publish -r --dry-run fans out across the workspace" {
+	_setup_workspace_fixture
+
+	run aube publish -r --dry-run --registry=https://r.example.com/
+	assert_success
+	# Both non-private workspace packages appear in the dry-run output.
+	assert_output --partial "@test/lib@1.0.0"
+	assert_output --partial "@test/app@1.0.0"
+	# The private workspace-root `aube-test-workspace` must not publish.
+	refute_output --partial "aube-test-workspace"
+}
+
+@test "aube publish -F selects a single workspace package" {
+	_setup_workspace_fixture
+
+	run aube publish -F @test/lib --dry-run --registry=https://r.example.com/
+	assert_success
+	assert_output --partial "@test/lib@1.0.0"
+	refute_output --partial "@test/app"
+}
+
+@test "aube publish -r --dry-run --json tags every outcome with a status" {
+	_setup_workspace_fixture
+
+	run bash -c "aube publish -r --dry-run --json --registry=https://r.example.com/ | jq -r '.[] | .name + \" \" + .status' | sort"
+	assert_success
+	assert_line "@test/app dry-run"
+	assert_line "@test/lib dry-run"
+}
+
+@test "aube publish -F errors cleanly when nothing matches" {
+	_setup_workspace_fixture
+
+	run aube publish -F @test/nope --dry-run --registry=https://r.example.com/
+	assert_failure
+	assert_output --partial "did not match"
+}
+
+@test "aube publish -r errors outside a workspace" {
+	_write_publishable_pkg
+
+	run aube publish -r --dry-run --registry=https://r.example.com/
+	assert_failure
+	assert_output --partial "no workspace packages"
+}
+
+@test "aube publish -r skips packages marked private" {
+	# Build an inline workspace with one publishable package and one
+	# private one, so the private-skip logic gets exercised on an
+	# actual `packages:` member (the shared fixture's private root
+	# isn't a workspace member, so it alone doesn't cover this path).
+	cat >pnpm-workspace.yaml <<-'EOF'
+		packages:
+		  - packages/*
+	EOF
+	cat >package.json <<-'EOF'
+		{"name":"root","version":"0.0.0","private":true}
+	EOF
+	mkdir -p packages/pub packages/priv
+	cat >packages/pub/package.json <<-'EOF'
+		{"name":"pub-pkg","version":"0.1.0","main":"index.js","files":["index.js"]}
+	EOF
+	echo "module.exports = 1" >packages/pub/index.js
+	cat >packages/priv/package.json <<-'EOF'
+		{"name":"priv-pkg","version":"0.1.0","private":true,"main":"index.js","files":["index.js"]}
+	EOF
+	echo "module.exports = 1" >packages/priv/index.js
+
+	run aube publish -r --dry-run --registry=https://r.example.com/
+	assert_success
+	assert_output --partial "pub-pkg@0.1.0"
+	refute_output --partial "priv-pkg"
+}
+
+_start_publish_server() {
+	# Starts a minimal mock registry that reports `publish-smoke@0.1.0`
+	# already exists (GET returns a packument with that version) and
+	# accepts any PUT. Writes `publish-server-port` and exports
+	# `PUBLISH_SERVER_PID`. The PUT handler also writes
+	# `publish-server-put.log` so tests can assert whether a request
+	# actually reached it.
+	cat >publish-server.mjs <<'NODE'
+import http from 'node:http';
+import fs from 'node:fs';
+
+const existing = {
+  name: 'publish-smoke',
+  'dist-tags': { latest: '0.1.0' },
+  versions: { '0.1.0': { name: 'publish-smoke', version: '0.1.0' } },
+};
+const server = http.createServer((req, res) => {
+  if (req.method === 'GET' && req.url === '/publish-smoke') {
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify(existing));
+    return;
+  }
+  if (req.method === 'PUT' && req.url === '/publish-smoke') {
+    let size = 0;
+    req.on('data', (c) => { size += c.length; });
+    req.on('end', () => {
+      fs.appendFileSync('publish-server-put.log', `${req.url} ${size}\n`);
+      res.statusCode = 201;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ ok: true, id: 'publish-smoke' }));
+    });
+    return;
+  }
+  res.statusCode = 404;
+  res.end('{}');
+});
+server.listen(0, '127.0.0.1', () => {
+  fs.writeFileSync('publish-server-port', String(server.address().port));
+});
+NODE
+	node publish-server.mjs &
+	PUBLISH_SERVER_PID=$!
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		[ -f publish-server-port ] && break
+		sleep 0.1
+	done
+}
+
+_stop_publish_server() {
+	if [ -n "${PUBLISH_SERVER_PID:-}" ]; then
+		kill "$PUBLISH_SERVER_PID" 2>/dev/null || true
+		wait "$PUBLISH_SERVER_PID" 2>/dev/null || true
+		PUBLISH_SERVER_PID=
+	fi
+}
+
+@test "aube publish refuses to re-publish a version already on the registry" {
+	_write_publishable_pkg
+	_start_publish_server
+	port="$(cat publish-server-port)"
+	echo "//127.0.0.1:${port}/:_authToken=fake" >.npmrc
+
+	run aube publish --no-git-checks --registry "http://127.0.0.1:${port}/"
+	rc=$status
+	_stop_publish_server
+	[ "$rc" -ne 0 ]
+	assert_output --partial "publish-smoke@0.1.0 is already on"
+	assert_output --partial "--force"
+	# The pre-flight must short-circuit before the PUT; the mock
+	# server only logs PUTs to this file.
+	[ ! -s publish-server-put.log ] || {
+		echo "unexpected PUT: $(cat publish-server-put.log)" >&2
+		false
+	}
+}
+
+@test "aube publish --force re-publishes past the existence check" {
+	_write_publishable_pkg
+	_start_publish_server
+	port="$(cat publish-server-port)"
+	echo "//127.0.0.1:${port}/:_authToken=fake" >.npmrc
+
+	run aube publish --force --no-git-checks --registry "http://127.0.0.1:${port}/"
+	rc=$status
+	_stop_publish_server
+	[ "$rc" -eq 0 ]
+	# A real PUT went through to the mock.
+	run grep -c "^/publish-smoke " publish-server-put.log
+	assert_success
+	[ "$output" = "1" ]
+}
+
+@test "aube publish --dry-run --json emits a pnpm-compatible array" {
+	_write_publishable_pkg
+
+	run aube publish --dry-run --json --registry=https://r.example.com/
+	assert_success
+	# Shape matches `pnpm publish --json` / `aube pack --json`: a
+	# single-element array with name/version/filename/files.
+	run bash -c "aube publish --dry-run --json --registry=https://r.example.com/ | jq -r '.[0].name + \"@\" + .[0].version'"
+	assert_success
+	assert_output "publish-smoke@0.1.0"
+	run bash -c "aube publish --dry-run --json --registry=https://r.example.com/ | jq -r '.[0].filename'"
+	assert_success
+	assert_output "publish-smoke-0.1.0.tgz"
+	run bash -c "aube publish --dry-run --json --registry=https://r.example.com/ | jq -r '.[0].files[].path' | sort"
+	assert_success
+	assert_line "index.js"
+	assert_line "package.json"
+}
