@@ -1261,6 +1261,11 @@ impl Resolver {
                         parent_pkg
                             .dependencies
                             .insert(task.name.clone(), ws_version.clone());
+                        if task.dep_type == DepType::Optional {
+                            parent_pkg
+                                .optional_dependencies
+                                .insert(task.name.clone(), ws_version.clone());
+                        }
                     }
                     if task.is_root {
                         note_root_done!();
@@ -1298,7 +1303,12 @@ impl Resolver {
                     {
                         parent_pkg
                             .dependencies
-                            .insert(task.name.clone(), matched_ver);
+                            .insert(task.name.clone(), matched_ver.clone());
+                        if task.dep_type == DepType::Optional {
+                            parent_pkg
+                                .optional_dependencies
+                                .insert(task.name.clone(), matched_ver);
+                        }
                     }
                     if task.is_root {
                         note_root_done!();
@@ -1367,6 +1377,11 @@ impl Resolver {
                             parent_pkg
                                 .dependencies
                                 .insert(task.name.clone(), version.clone());
+                            if task.dep_type == DepType::Optional {
+                                parent_pkg
+                                    .optional_dependencies
+                                    .insert(task.name.clone(), version.clone());
+                            }
                         }
                         if !visited.contains(&dep_path) {
                             visited.insert(dep_path.clone());
@@ -1409,6 +1424,7 @@ impl Resolver {
                                     version: version.clone(),
                                     integrity: locked_pkg.integrity.clone(),
                                     dependencies: BTreeMap::new(),
+                                    optional_dependencies: BTreeMap::new(),
                                     peer_dependencies: locked_pkg.peer_dependencies.clone(),
                                     peer_dependencies_meta: locked_pkg
                                         .peer_dependencies_meta
@@ -1439,10 +1455,16 @@ impl Resolver {
                                     .next()
                                     .unwrap_or(dep_version)
                                     .to_string();
+                                let dep_type =
+                                    if locked_pkg.optional_dependencies.contains_key(dep_name) {
+                                        DepType::Optional
+                                    } else {
+                                        DepType::Production
+                                    };
                                 queue.push_back(ResolveTask {
                                     name: dep_name.clone(),
                                     range: canonical_version,
-                                    dep_type: DepType::Production,
+                                    dep_type,
                                     is_root: false,
                                     parent: Some(dep_path.clone()),
                                     importer: task.importer.clone(),
@@ -1736,6 +1758,11 @@ impl Resolver {
                     parent_pkg
                         .dependencies
                         .insert(task.name.clone(), version.clone());
+                    if task.dep_type == DepType::Optional {
+                        parent_pkg
+                            .optional_dependencies
+                            .insert(task.name.clone(), version.clone());
+                    }
                 }
 
                 // Skip if already fully processed this exact version
@@ -1831,6 +1858,7 @@ impl Resolver {
                         version: version.clone(),
                         integrity,
                         dependencies: BTreeMap::new(),
+                        optional_dependencies: BTreeMap::new(),
                         peer_dependencies: peer_deps,
                         peer_dependencies_meta: peer_meta,
                         dep_path: dep_path.clone(),
@@ -2927,6 +2955,14 @@ fn dedupe_peer_suffixes(graph: LockfileGraph) -> LockfileGraph {
                 (n, new_v)
             })
             .collect();
+        let new_optional_dependencies: BTreeMap<String, String> = pkg
+            .optional_dependencies
+            .into_iter()
+            .map(|(n, v)| {
+                let new_v = rewrite_tail(&n, &v);
+                (n, new_v)
+            })
+            .collect();
         new_packages.insert(
             new_key.clone(),
             LockedPackage {
@@ -2934,6 +2970,7 @@ fn dedupe_peer_suffixes(graph: LockfileGraph) -> LockfileGraph {
                 version: pkg.version,
                 integrity: pkg.integrity,
                 dependencies: new_dependencies,
+                optional_dependencies: new_optional_dependencies,
                 peer_dependencies: pkg.peer_dependencies,
                 peer_dependencies_meta: pkg.peer_dependencies_meta,
                 dep_path: new_key,
@@ -3311,6 +3348,15 @@ fn visit_peer_context(
     }
 
     visiting.remove(&contextualized);
+    let new_optional_dependencies: BTreeMap<String, String> = pkg
+        .optional_dependencies
+        .keys()
+        .filter_map(|name| {
+            new_dependencies
+                .get(name)
+                .map(|tail| (name.clone(), tail.clone()))
+        })
+        .collect();
 
     out_packages.insert(
         contextualized.clone(),
@@ -3319,6 +3365,7 @@ fn visit_peer_context(
             version: pkg.version.clone(),
             integrity: pkg.integrity.clone(),
             dependencies: new_dependencies,
+            optional_dependencies: new_optional_dependencies,
             peer_dependencies: pkg.peer_dependencies.clone(),
             peer_dependencies_meta: pkg.peer_dependencies_meta.clone(),
             dep_path: contextualized.clone(),
@@ -5850,6 +5897,64 @@ mod tests {
             "dep-a@2.0.0 missing (transitive fetch fell through the ensure_fetch guard)"
         );
         assert!(graph.packages.contains_key("other-a@2.0.0"));
+    }
+
+    #[tokio::test]
+    async fn lockfile_reuse_preserves_transitive_optional_edges() {
+        let client = Arc::new(aube_registry::client::RegistryClient::new(
+            "http://127.0.0.1:0",
+        ));
+        let mut resolver = Resolver::new(client);
+
+        let mut existing_pkgs: BTreeMap<String, LockedPackage> = BTreeMap::new();
+        existing_pkgs.insert(
+            "host@1.0.0".to_string(),
+            LockedPackage {
+                name: "host".to_string(),
+                version: "1.0.0".to_string(),
+                dep_path: "host@1.0.0".to_string(),
+                dependencies: [("native".to_string(), "1.0.0".to_string())].into(),
+                optional_dependencies: [("native".to_string(), "1.0.0".to_string())].into(),
+                ..Default::default()
+            },
+        );
+        existing_pkgs.insert(
+            "native@1.0.0".to_string(),
+            LockedPackage {
+                name: "native".to_string(),
+                version: "1.0.0".to_string(),
+                dep_path: "native@1.0.0".to_string(),
+                ..Default::default()
+            },
+        );
+        let existing = LockfileGraph {
+            packages: existing_pkgs,
+            importers: BTreeMap::new(),
+            settings: Default::default(),
+            overrides: BTreeMap::new(),
+            ignored_optional_dependencies: BTreeSet::new(),
+            times: BTreeMap::new(),
+            skipped_optional_dependencies: BTreeMap::new(),
+            catalogs: BTreeMap::new(),
+        };
+
+        let mut manifest = PackageJson::default();
+        manifest
+            .dependencies
+            .insert("host".to_string(), "1.0.0".to_string());
+
+        let graph = resolver
+            .resolve(&manifest, Some(&existing))
+            .await
+            .expect("resolve failed");
+
+        let host = graph.packages.get("host@1.0.0").unwrap();
+        assert_eq!(host.dependencies.get("native").unwrap(), "1.0.0");
+        assert_eq!(
+            host.optional_dependencies.get("native").unwrap(),
+            "1.0.0",
+            "lockfile reuse must keep the optional edge metadata for write()"
+        );
     }
 
     // ===== peersSuffixMaxLength =====
