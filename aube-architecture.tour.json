@@ -1,0 +1,287 @@
+{
+  "id": "aube-architecture",
+  "title": "Aube: A Tour of the Install Pipeline",
+  "description": "Walk through aube's Rust workspace — from the command-line entry point through the four-stage install pipeline (resolve, fetch, store, link) and the supporting crates that surround it.",
+  "version": "1.0.0",
+  "audience": "Contributors & Curious Engineers",
+  "steps": [
+    {
+      "id": "overview",
+      "title": "The Repository at a Glance",
+      "description": "Aube is a fast Node.js package manager written in Rust. The workspace is a Cargo monorepo: a thin command-line binary sits on top of nine focused crates that implement the package manager. Around it live an integration test suite with a vendored offline registry, a hermetic benchmark harness, and a documentation site.",
+      "focusDirectory": "",
+      "colorMode": "fileTypes",
+      "estimatedTime": 60
+    },
+    {
+      "id": "the-crates",
+      "title": "Nine Crates, One Package Manager",
+      "description": "Everything interesting lives here. Each subdirectory is a Cargo crate with a single focused job: resolving dependencies, talking to the npm registry, managing the content-addressable store, linking the installed tree, parsing manifests, and so on. One crate is the command-line binary; the rest are libraries it composes.",
+      "focusDirectory": "crates",
+      "colorMode": "fileTypes",
+      "estimatedTime": 75
+    },
+    {
+      "id": "cli-entry",
+      "title": "The CLI Entry Point",
+      "description": "This is where execution starts. The commands directory is a Clap-driven dispatch table with one file per subcommand — install, add, publish, dlx, and the rest. A small state module tracks the lockfile and manifest hash so auto-install can detect when a project is stale, and a progress module owns the animated install UI.",
+      "focusDirectory": "crates/aube/src",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "entry-points",
+          "name": "CLI Entry & State",
+          "color": "#3b82f6",
+          "items": [
+            { "path": "crates/aube/src/main.rs", "type": "file" },
+            { "path": "crates/aube/src/state.rs", "type": "file" },
+            { "path": "crates/aube/src/progress.rs", "type": "file" }
+          ],
+          "opacity": 0.75,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "commands",
+          "name": "Subcommands",
+          "color": "#a855f7",
+          "items": [
+            { "path": "crates/aube/src/commands", "type": "directory" }
+          ],
+          "opacity": 0.5,
+          "renderStrategy": "border"
+        }
+      ],
+      "estimatedTime": 90
+    },
+    {
+      "id": "install-pipeline",
+      "title": "The Install Pipeline",
+      "description": "An install flows through four crates in sequence. The resolver walks the dependency graph with semver satisfaction. The registry client fetches packuments and tarballs. The store imports those tarballs into a global content-addressable store. The linker materializes the installed tree as an isolated symlink layout. Each colored layer is one stage.",
+      "focusDirectory": "crates",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "resolve",
+          "name": "1. Resolve",
+          "color": "#3b82f6",
+          "items": [
+            { "path": "crates/aube-resolver", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "fetch",
+          "name": "2. Fetch",
+          "color": "#10b981",
+          "items": [
+            { "path": "crates/aube-registry", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "store",
+          "name": "3. Store (CAS)",
+          "color": "#f59e0b",
+          "items": [
+            { "path": "crates/aube-store", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "link",
+          "name": "4. Link",
+          "color": "#ef4444",
+          "items": [
+            { "path": "crates/aube-linker", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        }
+      ],
+      "estimatedTime": 150
+    },
+    {
+      "id": "supporting-crates",
+      "title": "Supporting Crates",
+      "description": "Five helper crates sit around the pipeline. Manifest parses project metadata. Lockfile reads and writes six different formats, preserving whichever is already on disk. Workspace resolves local packages, scripts runs root-package lifecycle hooks with dependency scripts skipped by default, and settings loads user and project configuration.",
+      "focusDirectory": "crates",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "manifest-workspace",
+          "name": "Manifest & Workspace",
+          "color": "#8b5cf6",
+          "items": [
+            { "path": "crates/aube-manifest", "type": "directory" },
+            { "path": "crates/aube-workspace", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "lockfile",
+          "name": "Lockfile (6 formats)",
+          "color": "#ec4899",
+          "items": [
+            { "path": "crates/aube-lockfile", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "scripts-settings",
+          "name": "Scripts & Settings",
+          "color": "#14b8a6",
+          "items": [
+            { "path": "crates/aube-scripts", "type": "directory" },
+            { "path": "crates/aube-settings", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        }
+      ],
+      "estimatedTime": 120
+    },
+    {
+      "id": "testing",
+      "title": "BATS Tests with an Offline Registry",
+      "description": "Integration tests are organized one file per subcommand or feature. The vendored Verdaccio fixture registry has no uplink, so the whole suite runs with zero network access — every tarball it serves is checked into the repository. Separate fixture projects give the tests realistic packages to install against.",
+      "focusDirectory": "test",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "offline-registry",
+          "name": "Offline Verdaccio Registry",
+          "color": "#f97316",
+          "items": [
+            { "path": "test/registry", "type": "directory" }
+          ],
+          "opacity": 0.75,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "test-helpers",
+          "name": "BATS Runner & Helpers",
+          "color": "#06b6d4",
+          "items": [
+            { "path": "test/bats", "type": "directory" },
+            { "path": "test/test_helper", "type": "directory" },
+            { "path": "test/setup_suite.bash", "type": "file" }
+          ],
+          "opacity": 0.65,
+          "renderStrategy": "border"
+        }
+      ],
+      "estimatedTime": 90
+    },
+    {
+      "id": "benchmarks-docs",
+      "title": "Benchmarks and Docs",
+      "description": "The benchmark harness compares aube against pnpm, npm, yarn, and bun. A hermetic mode pairs a local registry with a bandwidth-throttling proxy so cold-cache numbers stay reproducible. The VitePress docs site reads those published results at build time and hosts the landing page, CLI reference, and migration guides for each competing package manager.",
+      "focusDirectory": "",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "bench",
+          "name": "Benchmarks",
+          "color": "#eab308",
+          "items": [
+            { "path": "benchmarks", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "docs",
+          "name": "VitePress Docs Site",
+          "color": "#22c55e",
+          "items": [
+            { "path": "docs", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        }
+      ],
+      "estimatedTime": 75
+    },
+    {
+      "id": "config-and-release",
+      "title": "Config, Packaging, and Release",
+      "description": "The root carries the Cargo manifests plus a few aube-specific pieces: a task runner config for the shortcuts contributors actually run, a packaging directory for Homebrew and Debian distro artifacts, release automation for versioning and asset uploads, and a cluster of contributor docs explaining the project conventions.",
+      "focusDirectory": "",
+      "colorMode": "fileTypes",
+      "highlightLayers": [
+        {
+          "id": "cargo",
+          "name": "Cargo Workspace",
+          "color": "#dc2626",
+          "items": [
+            { "path": "Cargo.toml", "type": "file" },
+            { "path": "Cargo.lock", "type": "file" }
+          ],
+          "opacity": 0.8,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "task-runner",
+          "name": "Task Runner",
+          "color": "#0ea5e9",
+          "items": [
+            { "path": "mise.toml", "type": "file" },
+            { "path": "mise-tasks", "type": "directory" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "release",
+          "name": "Packaging & Release",
+          "color": "#a3a3a3",
+          "items": [
+            { "path": "packaging", "type": "directory" },
+            { "path": "npm", "type": "directory" },
+            { "path": "release-plz.toml", "type": "file" },
+            { "path": "release.json", "type": "file" }
+          ],
+          "opacity": 0.65,
+          "renderStrategy": "border"
+        },
+        {
+          "id": "docs-files",
+          "name": "Contributor Docs",
+          "color": "#f472b6",
+          "items": [
+            { "path": "CLAUDE.md", "type": "file" },
+            { "path": "CONTRIBUTING.md", "type": "file" },
+            { "path": "AGENTS.md", "type": "file" },
+            { "path": "README.md", "type": "file" }
+          ],
+          "opacity": 0.7,
+          "renderStrategy": "border"
+        }
+      ],
+      "estimatedTime": 90
+    },
+    {
+      "id": "recap",
+      "title": "Putting It All Together",
+      "description": "One pipeline — command line, resolver, registry, store, linker — with five sidecar crates around it. Tests run offline; benchmarks are hermetic and throttled. Good places to dive in next: the install command for the orchestration, the linker for the symlink layout, or the install test for end-to-end behavior.",
+      "focusDirectory": "",
+      "colorMode": "fileTypes",
+      "estimatedTime": 60
+    }
+  ],
+  "metadata": {
+    "author": "File City Tour Generator",
+    "createdAt": "2026-04-19T00:00:00.000Z",
+    "tags": [
+      "architecture",
+      "rust",
+      "package-manager",
+      "onboarding"
+    ]
+  }
+}
