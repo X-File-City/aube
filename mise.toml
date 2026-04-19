@@ -2,13 +2,15 @@
 _.path = ["./bin"]
 
 [tools]
+actionlint = "latest"
+"github:bnjbvr/cargo-machete" = "latest"
+"github:foresterre/cargo-msrv" = "latest"
 hk = "latest"
-pkl = "latest"
+node = "24"
 pitchfork = "latest"
+pkl = "latest"
 shellcheck = "latest"
 shfmt = "latest"
-actionlint = "latest"
-node = "24"
 usage = "latest"
 
 [tasks.lint]
