@@ -131,7 +131,10 @@ pub async fn apply(
         } else {
             "deprecate"
         };
-        eprintln!("Would {verb} {} version(s) of {name}:", matched.len());
+        eprintln!(
+            "Would {verb} {} of {name}:",
+            pluralizer::pluralize("version", matched.len() as isize, true)
+        );
         for v in &matched {
             eprintln!("  {v}");
         }
@@ -152,7 +155,10 @@ pub async fn apply(
     } else {
         "Deprecated"
     };
-    eprintln!("{verb} {} version(s) of {name}:", matched.len());
+    eprintln!(
+        "{verb} {} of {name}:",
+        pluralizer::pluralize("version", matched.len() as isize, true)
+    );
     for v in &matched {
         eprintln!("  {v}");
     }
