@@ -56,7 +56,7 @@
     {
       "id": "install-pipeline",
       "title": "The Install Pipeline",
-      "description": "An install flows through four crates in sequence. The resolver walks the dependency graph with semver satisfaction. The registry client fetches packuments and tarballs. The store imports those tarballs into a global content-addressable store. The linker materializes the installed tree as an isolated symlink layout. Each colored layer is one stage.",
+      "description": "An install flows through four crates in sequence. The resolver walks the dependency graph with semver satisfaction. The registry client fetches packuments and tarballs. The store imports them into a global content-addressable store. The linker materializes the installed tree as isolated symlinks.",
       "focusDirectory": "crates",
       "colorMode": "fileTypes",
       "highlightLayers": [
@@ -106,7 +106,7 @@
     {
       "id": "supporting-crates",
       "title": "Supporting Crates",
-      "description": "Five helper crates sit around the pipeline. Manifest parses project metadata. Lockfile reads and writes six different formats, preserving whichever is already on disk. Workspace resolves local packages, scripts runs root-package lifecycle hooks with dependency scripts skipped by default, and settings loads user and project configuration.",
+      "description": "Five helper crates sit around the pipeline. Manifest parses project metadata. Lockfile reads and writes six formats, preserving whichever is on disk. Workspace resolves local packages, scripts runs root lifecycle hooks with dependency scripts skipped by default, and settings loads user and project configuration.",
       "focusDirectory": "crates",
       "colorMode": "fileTypes",
       "highlightLayers": [
@@ -180,7 +180,7 @@
     {
       "id": "benchmarks-docs",
       "title": "Benchmarks and Docs",
-      "description": "The benchmark harness compares aube against pnpm, npm, yarn, and bun. A hermetic mode pairs a local registry with a bandwidth-throttling proxy so cold-cache numbers stay reproducible. The VitePress docs site reads those published results at build time and hosts the landing page, CLI reference, and migration guides for each competing package manager.",
+      "description": "The benchmark harness compares aube against pnpm, npm, yarn, and bun. A hermetic mode pairs a local registry with a bandwidth-throttling proxy so cold-cache numbers stay reproducible. The VitePress docs site reads those results at build time and hosts the landing page, CLI reference, and migration guides.",
       "focusDirectory": "",
       "colorMode": "fileTypes",
       "highlightLayers": [
